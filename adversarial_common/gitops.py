@@ -20,11 +20,17 @@ class GitError(Exception):
 _LOOP_IDENTITY = ("adversarial-loop", "loop@adversarial.local")
 
 
-def _run(workdir, args):
-    """Run ``git <args>`` in *workdir*. Returns (stdout, stderr, returncode)."""
+def _run(workdir, args, timeout=None):
+    """Run ``git <args>`` in *workdir*. Returns (stdout, stderr, returncode).
+
+    *timeout* (seconds) is forwarded to ``subprocess.run``; ``None`` waits
+    forever (the default for mutating ops). Callers doing cheap lookups
+    (e.g. :func:`get_current_branch`) pass a bounded timeout so a stalled git
+    can't hang the pipeline.
+    """
     proc = subprocess.run(
         ["git", *args],
-        capture_output=True, text=True, cwd=workdir,
+        capture_output=True, text=True, cwd=workdir, timeout=timeout,
     )
     return proc.stdout, proc.stderr, proc.returncode
 
@@ -132,8 +138,16 @@ def unstash(workdir, stash_ref):
 # --- branch management ------------------------------------------------------
 
 def get_current_branch(workdir):
-    """Return the current branch name. Raises :class:`GitError` on detached HEAD."""
-    out, err, rc = _run(workdir, ["symbolic-ref", "--short", "HEAD"])
+    """Return the current branch name.
+
+    Raises :class:`GitError` on detached HEAD or if git doesn't answer within
+    5 seconds (restoring the pre-consolidation inline lookup's ``timeout=5``);
+    callers catching ``GitError`` fall back cleanly instead of hanging forever.
+    """
+    try:
+        out, err, rc = _run(workdir, ["symbolic-ref", "--short", "HEAD"], timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise GitError(f"git symbolic-ref timed out after 5s: {exc}") from exc
     if rc != 0:
         raise GitError(f"not on a branch (detached HEAD?): {(err or out).strip()}")
     return out.strip()
@@ -178,6 +192,11 @@ def create_loop_branch(workdir, feature, parent_branch, prefix="loop"):
     name = f"{ns}{highest + 1}"
     _git(workdir, ["branch", name, parent_branch])
     return name
+
+
+def create_branch(workdir, name, parent):
+    """Create a branch *name* from *parent*. No-op if already exists."""
+    _git(workdir, ["branch", name, parent])
 
 
 def delete_branch(workdir, name):
@@ -229,10 +248,26 @@ def get_diff(workdir, base, head="HEAD", *extra_args):
 def squash_merge(workdir, source_branch, target_branch, message):
     """Checkout *target_branch*, squash-merge *source_branch*, commit, drop source.
 
+    Handles the fast-forward case where the source branch is a direct descendant:
+    falls back to ``git merge --ff-only`` instead of ``--squash`` (which would
+    produce an empty tree).
+
     Raises :class:`GitError` on merge conflict. The caller is left on
     *target_branch*.
     """
     _git(workdir, ["checkout", target_branch])
+    # Check if source is a direct descendant (fast-forward possible)
+    merge_base = _git(workdir, ["merge-base", target_branch, source_branch]).strip()
+    source_head = _git(workdir, ["rev-parse", source_branch]).strip()
+    if merge_base == source_head:
+        delete_branch(workdir, source_branch)
+        return
+    count_out = _git(workdir, ["rev-list", "--count", f"{merge_base}..{source_branch}"])
+    if count_out.strip() == "1":
+        out, err, rc = _run(workdir, ["merge", "--ff-only", source_branch])
+        if rc == 0:
+            delete_branch(workdir, source_branch)
+            return
     out, err, rc = _run(workdir, ["merge", "--squash", source_branch])
     if rc != 0:
         raise GitError(
