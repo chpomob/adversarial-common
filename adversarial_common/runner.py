@@ -36,12 +36,16 @@ def run_cli(cmd, stdin_text=None, timeout=600, cwd=None, persona_file=None):
         return "", f"Unsupported command type: {type(cmd).__name__}", -1
     if not argv:
         return "", "Empty command", -1
+    # Expand ~ in each argv element (shlex.split does not expand tilde)
+    argv = [os.path.expanduser(a) for a in argv]
 
     if persona_file:
         argv, stdin_text = providers.inject_persona(argv, persona_file, stdin_text)
 
-    out_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
-    err_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8")
+    # Child processes write raw bytes directly to these file descriptors. Decode
+    # malformed/non-UTF-8 output lossily rather than crashing while collecting it.
+    out_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    err_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
     try:
         try:
             proc = subprocess.Popen(
@@ -72,7 +76,7 @@ def run_cli(cmd, stdin_text=None, timeout=600, cwd=None, persona_file=None):
         err_f.close()
 
 
-def _fail_phase(label, code, stderr):
+def fail_phase(label, code, stderr):
     """Terminate the run when a CLI phase fails — never feed downstream phases.
 
     Exits 1 (pipeline/infrastructure failure)."""
@@ -82,6 +86,3 @@ def _fail_phase(label, code, stderr):
         suffix = "..." if len(stderr) > 500 else ""
         print(f"   stderr: {snippet}{suffix}")
     sys.exit(1)
-
-
-fail_phase = _fail_phase  # public alias

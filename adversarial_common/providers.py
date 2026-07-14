@@ -13,20 +13,33 @@ from pathlib import Path
 def detect_provider(cmd):
     """Return 'claude-tmux', 'codex', 'claude', 'pi', or 'other' from a command.
 
-    `cmd` may be a string or an argv list. claude-tmux is checked first (its
-    path contains 'claude'), then codex before claude so a codex binary living
-    under a claude-named path is not misclassified. 'pi' is checked before
-    'other' since pi is a known coding agent that uses tool-based file writes.
+    `cmd` may be a string or an argv list. Only the first token's executable
+    name is considered, so arguments and similarly named executables cannot
+    cause a provider misclassification.
     """
-    if not isinstance(cmd, str):
-        cmd = " ".join(cmd)
-    if 'claude-tmux' in cmd or 'claude_tmux' in cmd:
+    if isinstance(cmd, str):
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            return 'other'
+    else:
+        try:
+            tokens = list(cmd)
+        except TypeError:
+            return 'other'
+
+    if not tokens or not isinstance(tokens[0], str):
+        return 'other'
+
+    executable = os.path.basename(tokens[0])
+    if executable in {'claude-tmux', 'claude_tmux',
+                      'claude-tmux.py', 'claude_tmux.py'}:
         return 'claude-tmux'
-    if 'codex' in cmd:
+    if executable == 'codex':
         return 'codex'
-    if 'claude' in cmd:
+    if executable == 'claude':
         return 'claude'
-    if 'pi ' in cmd or cmd.strip() == 'pi' or '/pi ' in cmd:
+    if executable == 'pi':
         return 'pi'
     return 'other'
 
@@ -92,7 +105,9 @@ def resolve_role_cmd(role, flag_value, env_var, default=None):
         print(f"X No command configured for role '{role}' "
               f"(pass the CLI flag or set ${env_var})")
         sys.exit(1)
-    return os.path.expanduser(cmd) if cmd.startswith("~") else cmd
+    tokens = shlex.split(cmd)
+    tokens = [os.path.expanduser(t) for t in tokens]
+    return shlex.join(tokens)
 
 
 def default_wrapper_cmd(extra_flags=""):

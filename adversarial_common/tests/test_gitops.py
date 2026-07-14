@@ -6,6 +6,8 @@ import shutil
 import subprocess
 import tempfile
 
+import pytest
+
 from adversarial_common import gitops
 
 
@@ -150,6 +152,42 @@ class TestGitOps:
         assert not gitops.branch_exists(self.tmpdir, loop)
         msg, _, _ = _git(self.tmpdir, "log", "-1", "--pretty=%s")
         assert msg == "squashed feat"
+
+    def test_squash_merge_conflict_raises_and_cleans_worktree(self):
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "shared.txt", "base\n")
+        gitops.commit_all(self.tmpdir, "base")
+        loop = gitops.create_loop_branch(self.tmpdir, "conflict", "main")
+
+        _git(self.tmpdir, "checkout", loop)
+        _write(self.tmpdir, "shared.txt", "feature\n")
+        gitops.commit_all(self.tmpdir, "feature edit")
+
+        _git(self.tmpdir, "checkout", "main")
+        _write(self.tmpdir, "shared.txt", "parent\n")
+        gitops.commit_all(self.tmpdir, "parent edit")
+
+        with pytest.raises(gitops.GitError, match="squash merge.*failed") as exc:
+            gitops.squash_merge(self.tmpdir, loop, "main", "must not commit")
+
+        assert "CONFLICT" in str(exc.value)
+        assert gitops.get_current_branch(self.tmpdir) == "main"
+        assert gitops.branch_exists(self.tmpdir, loop)
+        assert not gitops.is_dirty(self.tmpdir)
+        assert _read(self.tmpdir, "shared.txt") == "parent\n"
+
+    def test_squash_merge_dirty_tree_raises(self):
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "tracked.txt", "original")
+        gitops.commit_all(self.tmpdir, "tracked base")
+        loop = gitops.create_loop_branch(self.tmpdir, "dirty", "main")
+        _write(self.tmpdir, "tracked.txt", "keep me")
+
+        with pytest.raises(gitops.GitError, match="tracked or staged changes"):
+            gitops.squash_merge(self.tmpdir, loop, "main", "must not commit")
+
+        assert gitops.branch_exists(self.tmpdir, loop)
+        assert _read(self.tmpdir, "tracked.txt") == "keep me"
 
     def test_reject_marker(self):
         gitops.auto_init(self.tmpdir)

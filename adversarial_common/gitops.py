@@ -18,15 +18,15 @@ class GitError(Exception):
 # Repo-local identity set when no identity is configured anywhere, so commits
 # never fail on a pre-existing repo lacking user.name/user.email (F6).
 _LOOP_IDENTITY = ("adversarial-loop", "loop@adversarial.local")
+DEFAULT_GIT_TIMEOUT = 120
 
 
-def _run(workdir, args, timeout=None):
+def _run(workdir, args, timeout=DEFAULT_GIT_TIMEOUT):
     """Run ``git <args>`` in *workdir*. Returns (stdout, stderr, returncode).
 
-    *timeout* (seconds) is forwarded to ``subprocess.run``; ``None`` waits
-    forever (the default for mutating ops). Callers doing cheap lookups
-    (e.g. :func:`get_current_branch`) pass a bounded timeout so a stalled git
-    can't hang the pipeline.
+    *timeout* (seconds) is forwarded to ``subprocess.run``. It defaults to
+    :data:`DEFAULT_GIT_TIMEOUT` so a stalled git cannot hang the pipeline;
+    callers may pass a different limit for operations with tighter bounds.
     """
     proc = subprocess.run(
         ["git", *args],
@@ -117,21 +117,38 @@ def is_dirty(workdir):
 def stash_dirty(workdir):
     """Stash any dirty changes (including untracked).
 
-    Returns the stash reference (``"stash@{0}"``) or ``""`` when nothing was
-    stashed.
+    Returns the stash commit SHA or ``""`` when nothing was stashed. The SHA
+    remains bound to this stash even if later stash operations change the
+    position of ``stash@{0}``.
     """
     if not is_dirty(workdir):
         return ""
     _git(workdir, ["stash", "push", "-u"])
-    return "stash@{0}"
+    return _git(workdir, ["rev-parse", "--verify", "stash@{0}"]).strip()
 
 
 def unstash(workdir, stash_ref):
-    """Pop *stash_ref*. Raises :class:`GitError` on conflict (human must resolve)."""
-    out, err, rc = _run(workdir, ["stash", "pop", stash_ref])
+    """Pop *stash_ref* by identity, even if its stash position has changed.
+
+    Git accepts only reflog selectors (not raw commit SHAs) for ``stash pop``.
+    Resolve the stable identity to its current position immediately before the
+    pop so a later stash cannot redirect this operation to ``stash@{0}``.
+    """
+    stash_sha = _git(workdir, ["rev-parse", "--verify", stash_ref]).strip()
+    stash_entries = _git(workdir, ["stash", "list", "--format=%H"]).splitlines()
+    try:
+        stash_index = stash_entries.index(stash_sha)
+    except ValueError as exc:
+        raise GitError(
+            f"stash {stash_ref} ({stash_sha}) is no longer in the stash list"
+        ) from exc
+
+    pop_ref = f"stash@{{{stash_index}}}"
+    out, err, rc = _run(workdir, ["stash", "pop", pop_ref])
     if rc != 0:
         raise GitError(
-            f"git stash pop {stash_ref} failed (possible conflict): {(err or out).strip()}"
+            f"git stash pop {stash_ref} failed (possible conflict): "
+            f"{(err or out).strip()}"
         )
 
 
@@ -248,31 +265,56 @@ def get_diff(workdir, base, head="HEAD", *extra_args):
 def squash_merge(workdir, source_branch, target_branch, message):
     """Checkout *target_branch*, squash-merge *source_branch*, commit, drop source.
 
-    Handles the fast-forward case where the source branch is a direct descendant:
-    falls back to ``git merge --ff-only`` instead of ``--squash`` (which would
-    produce an empty tree).
-
-    Raises :class:`GitError` on merge conflict. The caller is left on
-    *target_branch*.
+    Raises :class:`GitError` when the worktree is dirty or any merge operation
+    fails. A failed squash is cleaned up before the exception is raised, and
+    the caller is left on *target_branch* with the source branch preserved.
     """
+    status_out, status_err, status_rc = _run(
+        workdir, ["status", "--porcelain", "--untracked-files=no"]
+    )
+    if status_rc != 0:
+        raise GitError(
+            "could not check worktree before squash merge: "
+            f"{(status_err or status_out).strip() or f'git status exited {status_rc}'}"
+        )
+    if status_out.strip():
+        raise GitError(
+            f"cannot squash merge {source_branch} -> {target_branch}: "
+            "working tree has tracked or staged changes"
+        )
+
     _git(workdir, ["checkout", target_branch])
-    # Check if source is a direct descendant (fast-forward possible)
     merge_base = _git(workdir, ["merge-base", target_branch, source_branch]).strip()
     source_head = _git(workdir, ["rev-parse", source_branch]).strip()
+    # The source is already contained in the target. There is nothing to stage,
+    # but finalization is complete and the obsolete source branch can be removed.
     if merge_base == source_head:
         delete_branch(workdir, source_branch)
         return
-    count_out = _git(workdir, ["rev-list", "--count", f"{merge_base}..{source_branch}"])
-    if count_out.strip() == "1":
-        out, err, rc = _run(workdir, ["merge", "--ff-only", source_branch])
-        if rc == 0:
-            delete_branch(workdir, source_branch)
-            return
+
     out, err, rc = _run(workdir, ["merge", "--squash", source_branch])
     if rc != 0:
+        detail = (err or out).strip() or f"git merge --squash exited {rc}"
+        _cleanup_out, cleanup_err, cleanup_rc = _run(
+            workdir, ["reset", "--merge", "HEAD"]
+        )
+        if cleanup_rc != 0:
+            cleanup_detail = cleanup_err.strip() or f"exit {cleanup_rc}"
+            detail = f"{detail}; cleanup failed: {cleanup_detail}"
         raise GitError(
-            f"squash merge {source_branch} -> {target_branch} failed (conflict?): "
-            f"{(err or out).strip()}"
+            f"squash merge {source_branch} -> {target_branch} failed: {detail}"
+        )
+
+    _out, diff_err, diff_rc = _run(workdir, ["diff", "--cached", "--quiet"])
+    if diff_rc == 0:
+        # Histories may differ while resolving to the same tree (for example,
+        # a change followed by its revert). Treat that as a successful no-op.
+        delete_branch(workdir, source_branch)
+        return
+    if diff_rc != 1:
+        raise GitError(
+            "could not inspect squash-merge result: "
+            f"{diff_err.strip() or f'git diff --cached --quiet exited {diff_rc}'}"
         )
     _git(workdir, ["commit", "-m", message])
     delete_branch(workdir, source_branch)
