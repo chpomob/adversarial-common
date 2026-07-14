@@ -1,28 +1,36 @@
 # adversarial-common
 
-Shared engine for the `adversarial-code-loop` and `adversarial-code-review`
-skills. Not a standalone skill — a library imported by both scripts via:
+Shared engine for multi-persona adversarial pipelines on Hermes Agent / Claude Code / Codex / any LLM CLI.
 
-```python
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'adversarial-common'))
-from adversarial_common import runner, jsonio, providers, snapshot
-```
+Powers `adversarial-spec`, `adversarial-plan`, `adversarial-code-loop`, and `adversarial-code-review`.
 
-## Contents
+## What it is
 
-- `adversarial_common/runner.py` — hardened `run_cli()` (Popen + temp-file IO +
-  `start_new_session` + killpg on timeout) and `fail_phase()`
-- `adversarial_common/jsonio.py` — `strip_json_wrapper()` (largest-valid-JSON
-  extraction), `save_artifact()`, `resume_artifact()`, `write_final_json()`
-- `adversarial_common/providers.py` — `detect_provider()`, `inject_persona()`,
-  `enhance_cmd_for_project()`, `resolve_role_cmd()` (flag > env > default),
-  `default_wrapper_cmd()`
-- `adversarial_common/snapshot.py` — `snapshot_workdir()` git baseline
-- `personas/` — single source of truth for all role personas (English):
-  builder, critic, fixer, verifier, judge (loop) · architect, inspector,
-  cross_review, synthesis (review)
+A Python package providing the hardened infra that all adversarial skills share:
 
-Any fix to subprocess handling, JSON extraction, or provider behavior lands
-here once and benefits both pipelines — this replaces the old
-"mutualization checklist" process of manually porting fixes between the two
-scripts.
+- **`runner.py`** — subprocess execution with temp-file IO, process-group kill on timeout, non-UTF-8 tolerance
+- **`providers.py`** — CLI provider detection (Claude, Codex, pi, agy, …), persona injection, role-based command resolution
+- **`jsonio.py`** — 3-strategy JSON extraction (markdown fences, `{…}` extraction, `[…]` extraction), artifact persistence
+- **`gitops.py`** — git workflow: init, branch, commit, diff, stash, squash-merge, tag, reject-marker
+- **`snapshot.py`** — dirty-tree baseline for sandbox write detection
+- **`personas/`** — 15+ adversarial persona files (builder, critic, fixer, verifier, judge, architect, inspector, synthesis, …)
+
+## Comparison
+
+| Feature | adversarial-common | standalone MAD libs |
+|---------|-------------------|-------------------|
+| Git-native isolation | ✅ Branch-per-loop | ❌ |
+| Multi-provider | ✅ Claude, Codex, pi, agy, … | ❌ One provider |
+| Persona injection | ✅ Provider-aware (pi gets tool-based personas) | ❌ |
+| JSON robustness | ✅ 3-strategy parser | ❌ Strict `json.loads` |
+| Subprocess hardening | ✅ tempfile IO, killpg, UTF-8 replace | ❌ |
+
+## Dependencies
+
+- Python ≥ 3.11
+- PyYAML (for frontmatter parsing)
+- Git ≥ 2.5 (for worktree support)
+
+## License
+
+MIT
