@@ -2,8 +2,16 @@
 
 from pathlib import Path
 
-from .costs import BudgetReservation, CostLedger, UsageRecord
+from .costs import (
+    MODEL_PRICES,
+    PROVIDER_PRICE_ALIASES,
+    BudgetReservation,
+    CostLedger,
+    UsageRecord,
+    estimate_tokens,
+)
 from .gates import (
+    TRUNCATION_MARKER,
     check_context,
     enforce_input_cap,
     enforce_output_cap,
@@ -12,6 +20,60 @@ from .gates import (
     post_fix_gate,
     pre_build_gate,
 )
+from .jsonio import (
+    VALID_BASIS,
+    VALID_CONFIDENCE,
+    epistemic_distribution,
+    extract_frontmatter,
+    normalize_findings,
+    parse_frontmatter,
+    parse_json_output,
+    resume_artifact,
+    save_artifact,
+    strip_json_wrapper,
+    write_final_json,
+)
+from .providers import (
+    classify_transient_error,
+    default_wrapper_cmd,
+    detect_provider,
+    enhance_cmd_for_project,
+    extract_usage_metadata,
+    inject_persona,
+    is_transient_error,
+    persona_for_role,
+    resolve_role_cmd,
+    run_cmd,
+)
+from .report import render_html_report, render_report
+from .runner import (
+    CI_EXIT_BLOCKING,
+    CI_EXIT_CLEAN,
+    CI_EXIT_CONTEXT_BLOCKED,
+    CI_EXIT_INFRASTRUCTURE,
+    CI_EXIT_NON_BLOCKING,
+    COST_BUDGET_EXIT_CODE,
+    DEFAULT_MAX_INPUT_CHARS,
+    DEFAULT_MAX_OUTPUT_CHARS,
+    DEFAULT_RESEARCH_MAX_INPUT_CHARS,
+    DEFAULT_RESEARCH_MAX_OUTPUT_CHARS,
+    DEFAULT_RESEARCH_MAX_QUERIES,
+    DEFAULT_RESEARCH_MAX_RESULTS,
+    DEFAULT_RESEARCH_TIMEOUT,
+    RunResult,
+    build_final_payload,
+    ci_exit_code,
+    ci_mode,
+    ci_print,
+    ensure_final_payload,
+    fail_phase,
+    parse_fail_on,
+    run_cli,
+    run_delegated,
+    run_parallel,
+    run_research,
+)
+from .snapshot import snapshot_workdir
 
 
 PERSONAS_DIR = Path(__file__).resolve().parent.parent / "personas"
@@ -31,8 +93,37 @@ def load_persona(name):
 
 
 __all__ = [
-    "BudgetReservation", "CostLedger", "PERSONAS_DIR", "UsageRecord", "check_context",
-    "enforce_input_cap", "enforce_output_cap", "estimate_complexity",
-    "load_persona", "persona_path", "post_build_gate", "post_fix_gate",
-    "pre_build_gate",
+    # costs
+    "BudgetReservation", "CostLedger", "MODEL_PRICES",
+    "PROVIDER_PRICE_ALIASES", "UsageRecord", "estimate_tokens",
+    # gates
+    "TRUNCATION_MARKER", "check_context", "enforce_input_cap",
+    "enforce_output_cap", "estimate_complexity", "post_build_gate",
+    "post_fix_gate", "pre_build_gate",
+    # jsonio
+    "VALID_BASIS", "VALID_CONFIDENCE", "epistemic_distribution",
+    "extract_frontmatter", "normalize_findings", "parse_frontmatter",
+    "parse_json_output", "resume_artifact", "save_artifact",
+    "strip_json_wrapper", "write_final_json",
+    # providers
+    "classify_transient_error", "default_wrapper_cmd", "detect_provider",
+    "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",
+    "is_transient_error", "persona_for_role", "resolve_role_cmd", "run_cmd",
+    # report
+    "render_html_report", "render_report",
+    # runner
+    "CI_EXIT_BLOCKING", "CI_EXIT_CLEAN", "CI_EXIT_CONTEXT_BLOCKED",
+    "CI_EXIT_INFRASTRUCTURE", "CI_EXIT_NON_BLOCKING",
+    "COST_BUDGET_EXIT_CODE",
+    "DEFAULT_MAX_INPUT_CHARS", "DEFAULT_MAX_OUTPUT_CHARS",
+    "DEFAULT_RESEARCH_MAX_INPUT_CHARS", "DEFAULT_RESEARCH_MAX_OUTPUT_CHARS",
+    "DEFAULT_RESEARCH_MAX_QUERIES", "DEFAULT_RESEARCH_MAX_RESULTS",
+    "DEFAULT_RESEARCH_TIMEOUT",
+    "RunResult", "build_final_payload", "ci_exit_code", "ci_mode",
+    "ci_print", "ensure_final_payload", "fail_phase", "parse_fail_on",
+    "run_cli", "run_delegated", "run_parallel", "run_research",
+    # snapshot
+    "snapshot_workdir",
+    # personas
+    "PERSONAS_DIR", "load_persona", "persona_path",
 ]
