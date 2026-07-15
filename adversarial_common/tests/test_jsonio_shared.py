@@ -49,6 +49,20 @@ def test_parse_json_output_rejects_actual_capped_suffix_with_warning():
     assert warnings and warnings[0]["code"] == "truncated_json_output"
 
 
+def test_parse_json_output_rejects_capped_suffix_with_trailing_wrapper():
+    for suffix in ("\n", "\n```\n"):
+        warnings = []
+        incomplete = (
+            "```json\n"
+            '{"findings":[{"id":"A1"}]'
+            + TRUNCATION_MARKER
+            + suffix
+        )
+
+        assert jsonio.parse_json_output(incomplete, warnings=warnings) is None
+        assert warnings and warnings[0]["code"] == "truncated_json_output"
+
+
 def test_parse_json_output_allows_marker_mentioned_before_trailing_prose():
     text = '{"x":1}\nmarker:' + TRUNCATION_MARKER + "is discussed here"
 

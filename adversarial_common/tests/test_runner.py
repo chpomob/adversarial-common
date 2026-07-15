@@ -1,6 +1,8 @@
 """Retry and cap acceptance tests for the canonical CLI runner."""
 
+import json
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -371,3 +373,147 @@ def test_show_costs_prints_model_breakdown_to_stderr(monkeypatch, capsys):
     diagnostic = capsys.readouterr().err
     assert "model: 100 prompt + 50 completion tokens, $0.000200" in diagnostic
     assert "total: $0.000200" in diagnostic
+
+
+def test_run_parallel_bounds_workers_and_preserves_input_order(monkeypatch):
+    lock = threading.Lock()
+    active = 0
+    peak_active = 0
+    delays = {"first": 0.08, "second": 0.01, "third": 0.06, "fourth": 0.01}
+
+    def fake_run_cli(cmd, **kwargs):
+        nonlocal active, peak_active
+        with lock:
+            active += 1
+            peak_active = max(peak_active, active)
+        try:
+            time.sleep(delays[cmd])
+            return f"done:{cmd}", "", 0
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+    started = time.monotonic()
+    results = runner.run_parallel(
+        [(label, {"cmd": label}) for label in delays],
+        concurrency=2,
+    )
+    elapsed = time.monotonic() - started
+
+    assert peak_active == 2
+    assert elapsed < 0.21
+    assert [result["label"] for result in results] == list(delays)
+    assert [result["stdout"] for result in results] == [
+        f"done:{label}" for label in delays
+    ]
+
+
+def test_run_parallel_contains_exception_to_failing_sibling(monkeypatch):
+    def fake_run_cli(cmd, **kwargs):
+        if cmd == "bad":
+            raise RuntimeError("worker exploded")
+        return cmd.upper(), "", 0
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+    results = runner.run_parallel(
+        [
+            ("left", {"cmd": "left"}),
+            ("bad", {"cmd": "bad"}),
+            ("right", {"cmd": "right"}),
+        ],
+        concurrency=3,
+    )
+
+    assert [result["ok"] for result in results] == [True, False, True]
+    assert results[0]["stdout"] == "LEFT"
+    assert results[1]["error"] == "RuntimeError: worker exploded"
+    assert results[2]["stdout"] == "RIGHT"
+
+
+def test_run_delegated_low_complexity_uses_direct_fallback(monkeypatch):
+    calls = []
+
+    def fake_run_cli(cmd, stdin_text=None, **kwargs):
+        calls.append((cmd, stdin_text))
+        return "direct result", "", 0
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+    complexity_checks = []
+    monkeypatch.setattr(
+        runner.gates,
+        "estimate_complexity",
+        lambda text, max_agents: complexity_checks.append((text, max_agents))
+        or {"level": "low", "recommended_agents": 2},
+    )
+    result = runner.run_delegated(
+        "small input",
+        {"cmd": "decompose"},
+        {"cmd": "worker"},
+        {"cmd": "synthesize"},
+        fallback_call={"cmd": "direct"},
+    )
+
+    assert result["delegated"] is False
+    assert result["mode"] == "direct"
+    assert result["status"] == "fallback"
+    assert "below required level 'high'" in result["reason"]
+    assert calls == [("direct", "small input")]
+    assert result["result"] == ("direct result", "", 0)
+    assert complexity_checks == [("small input", 6)]
+
+
+def test_run_delegated_synthesizes_survivors_with_worker_origins(monkeypatch):
+    synthesis_inputs = []
+
+    def fake_run_cli(cmd, stdin_text=None, **kwargs):
+        if cmd == "decompose":
+            return json.dumps({
+                "tasks": [
+                    {"id": "alpha", "scope": "a.py"},
+                    {"id": "broken", "scope": "b.py"},
+                    {"id": "omega", "scope": "c.py"},
+                ]
+            }), "", 0
+        if cmd == "worker-broken":
+            return "", "provider unavailable", 9
+        if cmd.startswith("worker-"):
+            finding_id = cmd.removeprefix("worker-")
+            return json.dumps({
+                "findings": [{"id": finding_id, "confidence": "high", "basis": "code"}]
+            }), "", 0
+        if cmd == "synthesize":
+            synthesis_inputs.append(json.loads(stdin_text))
+            return json.dumps({
+                "findings": [{"id": "combined", "confidence": "high", "basis": "code"}]
+            }), "", 0
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+    result = runner.run_delegated(
+        "large input",
+        {"cmd": "decompose"},
+        lambda task: {"cmd": f"worker-{task['id']}"},
+        {"cmd": "synthesize"},
+        concurrency=2,
+        complexity={"level": "high", "recommended_agents": 3},
+    )
+
+    assert result["delegated"] is True
+    assert result["status"] == "synthesized"
+    assert result["partial"] is True
+    assert [worker["ok"] for worker in result["workers"]] == [True, False, True]
+    assert [worker["origin"] for worker in result["workers"]] == [
+        "worker", "worker", "worker"
+    ]
+    assert [worker["label"] for worker in result["survivors"]] == ["alpha", "omega"]
+    assert len(synthesis_inputs) == 1
+    assert [item["label"] for item in synthesis_inputs[0]] == ["alpha", "omega"]
+    assert all(
+        item["payload"]["findings"][0]["origin"] == "worker"
+        for item in synthesis_inputs[0]
+    )
+    assert (
+        result["synthesis"]["payload"]["findings"][0]["origin"]
+        == "worker"
+    )

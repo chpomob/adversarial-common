@@ -17,6 +17,9 @@ VALID_CONFIDENCE: Final = frozenset(CONFIDENCE_LEVELS)
 VALID_BASIS: Final = frozenset(BASIS_TYPES)
 
 _EPISTEMIC_WARNING_CODE: Final = "epistemic_label_defaulted"
+_TRUNCATION_SUFFIX_RE: Final = re.compile(
+    rf"{re.escape(TRUNCATION_MARKER.rstrip())}(?:\s*```)?\s*\Z"
+)
 
 
 def strip_json_wrapper(text):
@@ -82,7 +85,7 @@ def parse_json_output(text: str, warnings: list | None = None) -> dict | list | 
     try:
         result = json.loads(candidate)
     except (json.JSONDecodeError, ValueError):
-        if text.endswith(TRUNCATION_MARKER):
+        if _TRUNCATION_SUFFIX_RE.search(text):
             if warnings is not None:
                 warnings.append({
                     "code": "truncated_json_output",
