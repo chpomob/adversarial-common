@@ -6,6 +6,7 @@ import ast
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -188,6 +189,23 @@ def test_post_gate_success_merges_output_and_does_not_invoke_a_shell(tmp_path, g
     assert "diagnostic" in result["log"]
     assert result["truncated"] is False
     _assert_gate_result_shape(result)
+
+
+def test_string_gate_preserves_shell_syntax_in_preflight_and_execution(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'gate-test'\n")
+    command = (
+        "GATE_VALUE=second; "
+        "printf 'first\\n' && printf '%s\\n' \"$GATE_VALUE\""
+    )
+
+    preflight = pre_build_gate(tmp_path, command)
+    result = post_build_gate(tmp_path, command)
+
+    assert preflight["ok"] is True
+    assert Path(preflight["resolved_executable"]).name == "sh"
+    assert result["ok"] is True
+    assert result["log"] == "first\nsecond\n"
+    assert result["command"] == command
 
 
 def test_post_gate_reports_verification_failure_as_non_infrastructure(tmp_path):

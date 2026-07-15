@@ -334,6 +334,23 @@ def test_parallel_budget_reservation_admits_only_affordable_calls(monkeypatch):
     assert len(ledger.records) == 1
 
 
+def test_default_codex_command_is_costed_without_explicit_model(monkeypatch):
+    _attempts(monkeypatch, [("done", "", 0, True, False)])
+    ledger = CostLedger(env={})
+
+    result = runner.run_cli(
+        ["codex"],
+        ledger=ledger,
+        usage={"input_tokens": 100, "output_tokens": 50},
+        clock=FakeClock([0.0, 0.1]),
+    )
+
+    assert result[2] == 0
+    record = ledger.records[0]
+    assert record.model == "codex"
+    assert record.est_cost_usd == 0.000625
+
+
 def test_show_costs_prints_model_breakdown_to_stderr(monkeypatch, capsys):
     _attempts(monkeypatch, [("done", "", 0, True, False)])
     ledger = CostLedger(

@@ -27,6 +27,15 @@ MODEL_PRICES: Final[dict[str, dict[str, float]]] = {
     "gpt-5-mini": {"prompt": 0.25, "completion": 2.0},
 }
 
+# Provider commands intentionally omit a model when the provider's own default
+# should be used. Attribute those calls to a documented priced family instead
+# of silently treating the provider executable name as an unknown free model.
+PROVIDER_PRICE_ALIASES: Final[dict[str, str]] = {
+    "codex": "gpt-5",
+    "claude": "claude-sonnet-4",
+    "claude-tmux": "claude-sonnet-4",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class UsageRecord:
@@ -367,7 +376,7 @@ class CostLedger:
         expected = self._reservations.get(reservation.reservation_id)
         if expected is None:
             raise ValueError("budget reservation is unknown or already consumed")
-        if expected != Decimal(str(reservation.reserved_cost_usd)):
+        if _decimal_to_float(expected) != reservation.reserved_cost_usd:
             raise ValueError("budget reservation does not match ledger state")
         del self._reservations[reservation.reservation_id]
 
@@ -375,6 +384,9 @@ class CostLedger:
         exact = self._prices.get(model)
         if exact is not None:
             return exact
+        alias = PROVIDER_PRICE_ALIASES.get(model)
+        if alias is not None and alias in self._prices:
+            return self._prices[alias]
         matches = [
             family for family in self._prices if model.startswith(f"{family}-")
         ]
@@ -478,6 +490,7 @@ def _decimal_to_float(value: Decimal) -> float:
 
 
 __all__ = [
-    "BudgetReservation", "CostLedger", "MODEL_PRICES", "UsageRecord",
+    "BudgetReservation", "CostLedger", "MODEL_PRICES", "PROVIDER_PRICE_ALIASES",
+    "UsageRecord",
     "estimate_tokens",
 ]

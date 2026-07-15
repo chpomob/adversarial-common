@@ -141,15 +141,10 @@ def pre_build_gate(
     if not markers:
         return _gate_failure(result, 2, "no recognized project marker found", False)
     if command is not None:
-        argv, error = _command_argv(command)
+        _, resolved, error = _execution_command(command, root)
+        result["resolved_executable"] = resolved or ""
         if error:
             return _gate_failure(result, 127, error, True)
-        resolved = _resolve_executable(argv[0], root)
-        result["resolved_executable"] = resolved or ""
-        if resolved is None:
-            return _gate_failure(
-                result, 127, f"verification command not found: {argv[0]}", True
-            )
     result.update({"ok": True, "exit_code": 0, "infra": False, "log": ""})
     return result
 
@@ -189,18 +184,10 @@ def _run_verification_gate(
     log_cap = _non_negative_int("max_log_chars", max_log_chars)
     if not root.is_dir():
         return _gate_failure(result, 126, f"workdir is not a directory: {root}", True)
-    argv, error = _command_argv(command)
+    execution_argv, resolved, error = _execution_command(command, root)
+    result["resolved_executable"] = resolved or ""
     if error:
         return _gate_failure(result, 127, error, True)
-    resolved = _resolve_executable(argv[0], root)
-    result["resolved_executable"] = resolved or ""
-    if resolved is None:
-        return _gate_failure(result, 127, f"verification command not found: {argv[0]}", True)
-
-    # Execute the path that was just resolved. Besides avoiding a second PATH
-    # lookup, this closes the gap between preflight and process creation while
-    # preserving the configured command in the audit record.
-    execution_argv = [resolved, *argv[1:]]
     try:
         proc = subprocess.Popen(
             execution_argv,
@@ -332,6 +319,32 @@ def _command_argv(command: Any) -> tuple[list[str], str | None]:
     if not argv:
         return [], "verification command is empty"
     return argv, None
+
+
+def _execution_command(
+    command: Any, workdir: Path
+) -> tuple[list[str], str | None, str | None]:
+    """Resolve a gate while preserving the configured command contract.
+
+    String commands historically accepted shell syntax, so execute them through
+    ``sh -c``. Sequence commands remain literal argv and never invoke a shell.
+    In both cases Popen itself receives an argv vector with ``shell=False``.
+    """
+    if isinstance(command, str):
+        if not command.strip():
+            return [], None, "verification command is empty"
+        shell = shutil.which("sh")
+        if shell is None:
+            return [], None, "verification shell not found: sh"
+        return [shell, "-c", command], shell, None
+
+    argv, error = _command_argv(command)
+    if error:
+        return [], None, error
+    resolved = _resolve_executable(argv[0], workdir)
+    if resolved is None:
+        return [], None, f"verification command not found: {argv[0]}"
+    return [resolved, *argv[1:]], resolved, None
 
 
 def _resolve_executable(executable: str, workdir: Path) -> str | None:

@@ -104,6 +104,13 @@ def test_dated_model_uses_longest_family_price_and_unknown_is_free():
     assert unknown.est_cost_usd == 0.0
 
 
+def test_provider_only_model_ids_use_priced_default_families():
+    ledger = CostLedger(env={})
+
+    assert ledger.price_for("codex") == ledger.price_for("gpt-5")
+    assert ledger.price_for("claude") == ledger.price_for("claude-sonnet-4")
+
+
 def test_usage_records_and_record_snapshots_are_immutable():
     ledger = CostLedger(env={})
     record = ledger.record(
@@ -183,6 +190,25 @@ def test_budget_reservations_are_atomic_and_reconciled():
         reservation=reservation,
     )
     assert ledger.total_cost_usd == 0.0001
+
+
+def test_high_precision_budget_reservation_round_trips_without_rejection():
+    ledger = CostLedger(
+        prices={
+            "model": {"prompt": "123456789.0123456789", "completion": 0}
+        },
+        env={},
+    )
+    status, reservation = ledger.reserve_budget(
+        200_000_000, model="model", prompt_tokens=1_000_000
+    )
+
+    assert status["refused"] is False
+    record = ledger.record(
+        "model", usage={"input_tokens": 1_000_000, "output_tokens": 0},
+        reservation=reservation,
+    )
+    assert record.est_cost_usd == reservation.reserved_cost_usd
 
 
 def test_stderr_summary_includes_phase_and_persona_breakdowns():

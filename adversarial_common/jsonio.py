@@ -2,15 +2,21 @@
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
+from typing import Any, Final
 
 import yaml
 
 from .gates import TRUNCATION_MARKER
 
 
-VALID_CONFIDENCE = frozenset({"high", "medium", "low"})
-VALID_BASIS = frozenset({"spec", "code", "inference", "external"})
+CONFIDENCE_LEVELS: Final = ("high", "medium", "low")
+BASIS_TYPES: Final = ("spec", "code", "inference", "external")
+VALID_CONFIDENCE: Final = frozenset(CONFIDENCE_LEVELS)
+VALID_BASIS: Final = frozenset(BASIS_TYPES)
+
+_EPISTEMIC_WARNING_CODE: Final = "epistemic_label_defaulted"
 
 
 def strip_json_wrapper(text):
@@ -65,40 +71,57 @@ def parse_json_output(text: str, warnings: list | None = None) -> dict | list | 
     """Parse model JSON, rejecting truncated output and normalizing findings."""
     if not isinstance(text, str) or not text.strip():
         return None
-    if TRUNCATION_MARKER in text:
-        if warnings is not None:
-            warnings.append({
-                "code": "truncated_json_output",
-                "message": "provider output was truncated before JSON parsing",
-            })
-        return None
+
     candidate = text.strip()
     if candidate.startswith("```"):
         candidate = "\n".join(
             line for line in candidate.splitlines()
             if not line.strip().startswith("```")
         ).strip()
-    result = None
-    for parse_fn in (
-        lambda value: json.loads(value),
-        lambda value: json.loads(value[value.find("{"):value.rfind("}") + 1])
-        if "{" in value else None,
-        lambda value: json.loads(value[value.find("["):value.rfind("]") + 1])
-        if "[" in value else None,
-    ):
-        try:
-            result = parse_fn(candidate)
-            if result is not None:
-                break
-        except (json.JSONDecodeError, ValueError, IndexError):
-            continue
+
+    try:
+        result = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        if text.endswith(TRUNCATION_MARKER):
+            if warnings is not None:
+                warnings.append({
+                    "code": "truncated_json_output",
+                    "message": "provider output was truncated before JSON parsing",
+                })
+            return None
+        result = _extract_largest_json(candidate)
     if result is None:
         return None
     return normalize_findings(result, warnings=warnings)
 
 
-def normalize_findings(payload, warnings: list | None = None):
-    """Normalize finding epistemic labels in place without dropping findings."""
+def _extract_largest_json(text: str) -> Any | None:
+    """Return the largest independently decodable JSON object or array.
+
+    ``raw_decode`` stops at the end of a value, so trailing prose or stray
+    braces cannot corrupt an otherwise complete reviewer payload.
+    """
+    decoder = json.JSONDecoder()
+    candidates: list[tuple[int, int, Any]] = []
+    for start, character in enumerate(text):
+        if character not in "{[":
+            continue
+        try:
+            value, end = decoder.raw_decode(text[start:])
+        except json.JSONDecodeError:
+            continue
+        candidates.append((end, -start, value))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[:2])[2]
+
+
+def normalize_findings(payload: Any, warnings: list | None = None) -> Any:
+    """Normalize finding epistemic labels in place without dropping findings.
+
+    Only the two label fields and warning metadata are changed.  All source
+    metadata, in particular an ``origin`` marker, remains untouched.
+    """
     root = payload if isinstance(payload, dict) else None
     if isinstance(payload, dict):
         findings = payload.get("findings")
@@ -108,7 +131,8 @@ def normalize_findings(payload, warnings: list | None = None):
         findings = payload
     else:
         return payload
-    recorded = warnings if warnings is not None else []
+
+    normalization_warnings: list[dict[str, str]] = []
     for index, finding in enumerate(findings):
         if not isinstance(finding, dict):
             continue
@@ -118,25 +142,46 @@ def normalize_findings(payload, warnings: list | None = None):
             finding["confidence"] = "low"
             finding["basis"] = "inference"
             warning = {
-                "code": "epistemic_label_defaulted",
+                "code": _EPISTEMIC_WARNING_CODE,
                 "finding_id": str(finding.get("id", index)),
                 "message": "missing or invalid confidence/basis normalized to low/inference",
             }
-            recorded.append(warning)
-            finding.setdefault("warnings", []).append(warning["code"])
-    if root is not None and recorded:
-        root_warnings = root.setdefault("warnings", [])
-        for warning in recorded:
-            if warning not in root_warnings:
-                root_warnings.append(warning)
+            normalization_warnings.append(warning)
+            if warnings is not None:
+                warnings.append(warning)
+            _append_finding_warning(finding, warning["code"])
+
+    if root is not None and normalization_warnings:
+        _append_root_warnings(root, normalization_warnings)
     return payload
 
 
-def epistemic_distribution(findings) -> dict:
+def _append_finding_warning(finding: dict, code: str) -> None:
+    """Attach a warning code while tolerating malformed model metadata."""
+    current = finding.get("warnings")
+    if isinstance(current, list):
+        if code not in current:
+            current.append(code)
+        return
+    finding["warnings"] = [code] if current is None else [current, code]
+
+
+def _append_root_warnings(root: dict, new_warnings: list[dict[str, str]]) -> None:
+    """Record normalization warnings on an object payload."""
+    current = root.get("warnings")
+    if not isinstance(current, list):
+        current = [] if current is None else [current]
+        root["warnings"] = current
+    for warning in new_warnings:
+        if warning not in current:
+            current.append(warning)
+
+
+def epistemic_distribution(findings: Iterable[Any]) -> dict[str, dict]:
     """Count normalized epistemic labels without mutating caller-owned findings."""
     distribution = {
-        "confidence": {name: 0 for name in sorted(VALID_CONFIDENCE)},
-        "basis": {name: 0 for name in sorted(VALID_BASIS)},
+        "confidence": {name: 0 for name in CONFIDENCE_LEVELS},
+        "basis": {name: 0 for name in BASIS_TYPES},
         "combined": {},
     }
     for finding in findings:

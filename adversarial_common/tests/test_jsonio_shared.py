@@ -9,6 +9,7 @@ Covers:
 """
 
 from adversarial_common import jsonio
+from adversarial_common.gates import TRUNCATION_MARKER
 
 
 # --- parse_json_output (Item 5) --------------------------------------------
@@ -30,6 +31,63 @@ def test_parse_json_output_empty_and_none():
 
 
 # --- parse_frontmatter (Items 6 + 8) ---------------------------------------
+
+def test_parse_json_output_ignores_trailing_prose_and_stray_brace():
+    text = (
+        'preface {"verdict":"APPROVE","findings":[]}'
+        "\ncommentary containing a stray }"
+    )
+
+    assert jsonio.parse_json_output(text) == {"verdict": "APPROVE", "findings": []}
+
+
+def test_parse_json_output_rejects_actual_capped_suffix_with_warning():
+    warnings = []
+    incomplete = '{"findings":[{"id":"A1"}]' + TRUNCATION_MARKER
+
+    assert jsonio.parse_json_output(incomplete, warnings=warnings) is None
+    assert warnings and warnings[0]["code"] == "truncated_json_output"
+
+
+def test_parse_json_output_allows_marker_mentioned_before_trailing_prose():
+    text = '{"x":1}\nmarker:' + TRUNCATION_MARKER + "is discussed here"
+
+    assert jsonio.parse_json_output(text) == {"x": 1}
+
+
+def test_normalize_findings_defaults_labels_and_records_warnings():
+    warnings = []
+    payload = {
+        "findings": [
+            {"id": "A1", "confidence": "certain", "basis": "guess", "origin": "review"}
+        ],
+    }
+
+    result = jsonio.normalize_findings(payload, warnings=warnings)
+
+    finding = result["findings"][0]
+    assert finding["origin"] == "review"
+    assert (finding["confidence"], finding["basis"]) == ("low", "inference")
+    assert finding["warnings"] == ["epistemic_label_defaulted"]
+    assert warnings == result["warnings"]
+
+
+def test_epistemic_distribution_counts_defaults_without_mutation():
+    findings = [
+        {"id": "A1", "confidence": "high", "basis": "code"},
+        {"id": "A2"},
+    ]
+    snapshot = [finding.copy() for finding in findings]
+
+    distribution = jsonio.epistemic_distribution(findings)
+
+    assert findings == snapshot
+    assert distribution["confidence"] == {"high": 1, "medium": 0, "low": 1}
+    assert distribution["basis"] == {
+        "spec": 0, "code": 1, "inference": 1, "external": 0,
+    }
+    assert distribution["combined"] == {"high/code": 1, "low/inference": 1}
+
 
 def test_parse_frontmatter_parses_lists():
     # (c) the regex fallback would have flattened `list` into a scalar string;
