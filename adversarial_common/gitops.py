@@ -346,3 +346,45 @@ def ensure_gitignore(workdir, pattern):
     separator = "" if (not existing or existing.endswith("\n")) else "\n"
     with gi.open("a") as fh:
         fh.write(separator + pattern + "\n")
+
+
+# --- worktree & cherry-pick --------------------------------------------------
+
+def create_worktree(repo, path, base_ref, branch_name=None):
+    """Create a git worktree at *path* from *base_ref*.
+
+    If *branch_name* is given, ``git worktree add -b <branch_name> <path>
+    <base_ref>`` creates a new branch for the worktree. Otherwise a detached
+    HEAD worktree is created.
+    """
+    args = ["worktree", "add"]
+    if branch_name:
+        args.extend(["-b", branch_name])
+    args.extend([str(path), base_ref])
+    _git(repo, args)
+
+
+def remove_worktree(repo, path):
+    """Force-remove a worktree and prune its metadata.
+
+    No-op (not an error) when the worktree does not exist.
+    """
+    p = Path(path)
+    if not p.exists():
+        return
+    _out, _err, rc = _run(repo, ["worktree", "remove", "--force", str(path)])
+    # Exit 0 on success; non-zero when already gone — ignore both.
+
+
+def cherry_pick(workdir, commit_ref):
+    """Cherry-pick *commit_ref* into the current branch in *workdir*.
+
+    Raises :class:`GitError` on conflict. The index is left clean (``cherry-pick
+    --abort`` has been run) before the exception is raised.
+    """
+    out, err, rc = _run(workdir, ["cherry-pick", commit_ref])
+    if rc != 0:
+        detail = (err or out).strip()
+        # Clean up: abort the cherry-pick so the index is not mid-merge.
+        _run(workdir, ["cherry-pick", "--abort"])
+        raise GitError(f"cherry-pick {commit_ref} failed: {detail}")
