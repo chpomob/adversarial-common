@@ -231,48 +231,144 @@ def default_wrapper_cmd(extra_flags=""):
     return f"{cmd} {extra_flags}".strip()
 
 
-def extract_usage_metadata(stdout="", stderr=""):
-    """Best-effort extraction of Claude/Codex token usage metadata."""
-    for text in (stderr, stdout):
-        for line in reversed((text or "").splitlines()):
-            try:
-                payload = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            usage = _find_usage(payload)
-            if usage:
-                return usage
+def extract_usage_metadata(stdout="", stderr="", *, provider=None):
+    """Extract normalized native token usage from Claude or Codex output.
+
+    Both CLIs have emitted several JSON and JSONL shapes over time. The
+    provider-specific adapters deliberately accept only complete,
+    non-negative input/output pairs. A generic adapter is retained when no
+    provider is supplied for callers that already use this public helper.
+    """
+    if provider is not None and not isinstance(provider, str):
+        provider = detect_provider(provider)
+    provider_name = (provider or "").strip().lower()
+    if provider_name == "claude-tmux":
+        provider_name = "claude"
+    adapters = {
+        "claude": _extract_claude_usage,
+        "codex": _extract_codex_usage,
+    }
+    adapter = adapters.get(provider_name, _extract_generic_usage)
+    for payload in _json_payloads(stderr, stdout):
+        usage = adapter(payload)
+        if usage is not None:
+            return usage
+
+    # Some wrapper versions print a compact usage object as diagnostic text.
+    # Restrict this fallback to known token field names and require both sides
+    # so an unrelated log counter is never mistaken for billable usage.
     combined = "\n".join((stdout or "", stderr or ""))
-    found = {}
-    for canonical, names in {
-        "prompt_tokens": ("prompt_tokens", "input_tokens"),
-        "completion_tokens": ("completion_tokens", "output_tokens"),
-    }.items():
-        for name in names:
-            match = re.search(rf'"?{name}"?\s*[:=]\s*(\d+)', combined)
-            if match:
-                found[canonical] = int(match.group(1))
-                break
-    return found or None
+    return _usage_from_text(combined)
+
+
+def _json_payloads(*streams):
+    for text in streams:
+        if not isinstance(text, str) or not text.strip():
+            continue
+        try:
+            yield json.loads(text)
+        except json.JSONDecodeError:
+            pass
+        for line in reversed(text.splitlines()):
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def _extract_claude_usage(value):
+    if not isinstance(value, (dict, list)):
+        return None
+    if isinstance(value, dict):
+        usage = _normalized_usage(value.get("usage"))
+        if usage is not None:
+            return usage
+        # Claude's result envelope can expose per-model usage using camelCase.
+        model_usage = value.get("modelUsage")
+        if isinstance(model_usage, dict):
+            prompt = completion = 0
+            found = False
+            for item in model_usage.values():
+                normalized = _normalized_usage(item)
+                if normalized is not None:
+                    prompt += normalized["prompt_tokens"]
+                    completion += normalized["completion_tokens"]
+                    found = True
+            if found:
+                return {
+                    "prompt_tokens": prompt,
+                    "completion_tokens": completion,
+                }
+    return _find_usage(value)
+
+
+def _extract_codex_usage(value):
+    if isinstance(value, dict):
+        for key in ("usage", "token_usage", "tokenUsage"):
+            usage = _normalized_usage(value.get(key))
+            if usage is not None:
+                return usage
+    return _find_usage(value)
+
+
+def _extract_generic_usage(value):
+    return _find_usage(value)
 
 
 def _find_usage(value):
     if isinstance(value, dict):
-        candidate = value.get("usage") if isinstance(value.get("usage"), dict) else value
-        prompt = candidate.get("prompt_tokens", candidate.get("input_tokens"))
-        completion = candidate.get("completion_tokens", candidate.get("output_tokens"))
-        if isinstance(prompt, int) and isinstance(completion, int):
-            return {"prompt_tokens": prompt, "completion_tokens": completion}
+        usage = _normalized_usage(value)
+        if usage is not None:
+            return usage
         for child in value.values():
             usage = _find_usage(child)
-            if usage:
+            if usage is not None:
                 return usage
     elif isinstance(value, list):
-        for child in value:
+        # Later JSONL/list events generally hold the cumulative turn total.
+        for child in reversed(value):
             usage = _find_usage(child)
-            if usage:
+            if usage is not None:
                 return usage
     return None
+
+
+def _normalized_usage(value):
+    if not isinstance(value, dict):
+        return None
+    prompt = _first_token_count(
+        value, "prompt_tokens", "input_tokens", "inputTokens"
+    )
+    completion = _first_token_count(
+        value, "completion_tokens", "output_tokens", "outputTokens"
+    )
+    if prompt is None or completion is None:
+        return None
+    return {"prompt_tokens": prompt, "completion_tokens": completion}
+
+
+def _first_token_count(value, *keys):
+    for key in keys:
+        count = value.get(key)
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            return count
+    return None
+
+
+def _usage_from_text(text):
+    found = {}
+    for canonical, names in {
+        "prompt_tokens": ("prompt_tokens", "input_tokens", "inputTokens"),
+        "completion_tokens": (
+            "completion_tokens", "output_tokens", "outputTokens"
+        ),
+    }.items():
+        for name in names:
+            match = re.search(rf'"?{name}"?\s*[:=]\s*(\d+)', text)
+            if match:
+                found[canonical] = int(match.group(1))
+                break
+    return found if len(found) == 2 else None
 
 
 def run_cmd(

@@ -2,7 +2,7 @@
 
 from pathlib import Path
 
-from .costs import CostLedger, UsageRecord
+from .costs import BudgetReservation, CostLedger, UsageRecord
 from .gates import (
     check_context,
     enforce_input_cap,
@@ -31,7 +31,7 @@ def load_persona(name):
 
 
 __all__ = [
-    "CostLedger", "PERSONAS_DIR", "UsageRecord", "check_context",
+    "BudgetReservation", "CostLedger", "PERSONAS_DIR", "UsageRecord", "check_context",
     "enforce_input_cap", "enforce_output_cap", "estimate_complexity",
     "load_persona", "persona_path", "post_build_gate", "post_fix_gate",
     "pre_build_gate",

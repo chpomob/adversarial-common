@@ -12,13 +12,15 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from typing import Any
 
-from . import gates, providers
+from . import costs, gates, providers
 
 
 DEFAULT_MAX_INPUT_CHARS = 256 * 1024
 DEFAULT_MAX_OUTPUT_CHARS = 128 * 1024
+COST_BUDGET_EXIT_CODE = 3
 
 
 class RunResult(tuple):
@@ -46,6 +48,8 @@ def run_cli(
     persona="",
     include_usage=False,
     show_costs=False,
+    budget=None,
+    max_completion_tokens=None,
     max_retries=3,
     base=2.0,
     jitter=1.0,
@@ -63,6 +67,10 @@ def run_cli(
     ``include_usage=True`` appends a fourth, JSON-serializable usage record.
     Retry attempts and cap events are exposed on the result's ``metadata``
     attribute without changing tuple unpacking.
+
+    A budgeted call requires ``max_completion_tokens`` to match the hard
+    output-token limit configured on the provider command. Its prompt and
+    maximum completion costs are reserved atomically before every attempt.
     """
     metadata = {"attempts": [], "cap_events": []}
     if isinstance(cmd, str):
@@ -89,6 +97,9 @@ def run_cli(
     jitter_cap = _non_negative_number("jitter", jitter)
     input_limit = _optional_cap("max_input_chars", max_input_chars)
     output_limit = _optional_cap("max_output_chars", max_output_chars)
+    completion_limit = _optional_cap(
+        "max_completion_tokens", max_completion_tokens
+    )
     if not isinstance(truncate_input, bool):
         raise TypeError("truncate_input must be a boolean")
     monotonic = time.monotonic if clock is None else clock
@@ -126,20 +137,67 @@ def run_cli(
                 )
             stdin_text = capped_input
 
+    if ledger is not None and not callable(getattr(ledger, "record", None)):
+        raise TypeError("ledger must provide record()")
+    if budget is not None and ledger is None:
+        raise ValueError("budget requires a shared CostLedger")
+    if budget is not None and completion_limit is None:
+        raise ValueError(
+            "budget requires max_completion_tokens matching the provider limit"
+        )
+    effective_model = model or _model_id(argv)
+    prompt_tokens_estimate = costs.estimate_tokens(stdin_text)
+    completion_tokens_estimate = completion_limit or 0
+
     stdout = stderr = ""
     returncode = -1
-    started = False
+    usage_records = []
+    provider_name = providers.detect_provider(argv)
     for attempt_index in range(retries + 1):
+        reservation = None
+        if budget is not None:
+            budget_status, reservation = _reserve_budget(
+                ledger,
+                budget,
+                effective_model,
+                prompt_tokens_estimate,
+                completion_tokens_estimate,
+            )
+            metadata["budget"] = budget_status
+            if budget_status["refused"]:
+                metadata["budget_exceeded"] = True
+                stdout = ""
+                stderr = (
+                    "Cost budget would be exceeded before provider attempt "
+                    f"{attempt_index + 1}: projected USD "
+                    f"{budget_status['projected_total_usd']:.10f} > USD "
+                    f"{budget_status['limit_usd']:.10f}"
+                )
+                returncode = COST_BUDGET_EXIT_CODE
+                break
+
         started_at = monotonic()
-        stdout, stderr, returncode, attempt_started, genuine_timeout = _execute_attempt(
-            argv, stdin_text, timeout, cwd
-        )
+        try:
+            (
+                raw_stdout,
+                raw_stderr,
+                returncode,
+                attempt_started,
+                genuine_timeout,
+            ) = _execute_attempt(argv, stdin_text, timeout, cwd)
+        except BaseException:
+            if reservation is not None:
+                ledger.release_budget(reservation)
+            raise
         elapsed = max(0.0, monotonic() - started_at)
-        started = started or attempt_started
+        stdout, stderr = raw_stdout, raw_stderr
+        native_usage = providers.extract_usage_metadata(
+            raw_stdout, raw_stderr, provider=provider_name
+        )
         retry_reason = None
         if not genuine_timeout:
             retry_reason = providers.classify_transient_error(
-                argv, returncode, stderr, elapsed=elapsed, timeout=timeout
+                argv, returncode, raw_stderr, elapsed=elapsed, timeout=timeout
             )
         retryable = retry_reason is not None
         record = {
@@ -152,13 +210,36 @@ def run_cli(
 
         if output_limit is not None:
             stdout = _cap_attempt_output(
-                stdout, "stdout", output_limit, attempt_index + 1, metadata
+                raw_stdout, "stdout", output_limit, attempt_index + 1, metadata
             )
             stderr = _cap_attempt_output(
-                stderr, "stderr", output_limit, attempt_index + 1, metadata
+                raw_stderr, "stderr", output_limit, attempt_index + 1, metadata
             )
 
         should_retry = returncode != 0 and retryable and attempt_index < retries
+        if attempt_started and ledger is not None:
+            # Explicit usage describes the terminal attempt. Retried failures
+            # must use their own provider metadata (or deterministic estimates).
+            effective_usage = (
+                usage if not should_retry and usage is not None else native_usage
+            )
+            usage_record = ledger.record(
+                effective_model,
+                prompt_text=stdin_text,
+                completion_text=raw_stdout,
+                usage=effective_usage,
+                phase=phase,
+                persona=persona,
+                reservation=reservation,
+            )
+            usage_records.append(usage_record)
+            record["usage"] = asdict(usage_record)
+        elif native_usage is not None:
+            record["native_usage"] = dict(native_usage)
+            metadata["native_usage"] = dict(native_usage)
+        if not attempt_started and reservation is not None:
+            ledger.release_budget(reservation)
+
         if should_retry:
             delay = backoff_base * (2 ** attempt_index)
             if jitter_cap:
@@ -169,19 +250,11 @@ def run_cli(
             break
         sleep(delay)
 
-    usage_record = None
-    if started and ledger is not None:
-        native_usage = usage or providers.extract_usage_metadata(stdout, stderr)
-        usage_record = ledger.record(
-            model or _model_id(argv),
-            prompt_text=stdin_text,
-            completion_text=stdout,
-            usage=native_usage,
-            phase=phase,
-            persona=persona,
-        )
-        if show_costs:
-            ledger.print_summary(file=sys.stderr)
+    if show_costs and ledger is not None:
+        ledger.print_summary(file=sys.stderr)
+    usage_record = _aggregate_usage(usage_records)
+    if usage_record is not None:
+        metadata["usage"] = asdict(usage_record)
     return _result(
         stdout, stderr, returncode, usage_record, include_usage, metadata
     )
@@ -332,24 +405,55 @@ def fail_phase(label, code, stderr):
     sys.exit(1)
 
 
+def _reserve_budget(
+    ledger, budget, model, prompt_tokens, completion_tokens
+):
+    reserve_method = getattr(ledger, "reserve_budget", None)
+    release_method = getattr(ledger, "release_budget", None)
+    if not callable(reserve_method) or not callable(release_method):
+        raise TypeError(
+            "budget requires a CostLedger with reserve_budget() and release_budget()"
+        )
+    return reserve_method(
+        budget,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+    )
+
+
+def _aggregate_usage(records):
+    if not records:
+        return None
+    if len(records) == 1:
+        return records[0]
+    first = records[0]
+    return costs.UsageRecord(
+        model=first.model,
+        prompt_tokens=sum(record.prompt_tokens for record in records),
+        completion_tokens=sum(record.completion_tokens for record in records),
+        est_cost_usd=round(sum(record.est_cost_usd for record in records), 10),
+        estimated=any(record.estimated for record in records),
+        phase=first.phase,
+        persona=first.persona,
+    )
+
+
 def _result(stdout, stderr, code, usage_record, include_usage, metadata=None):
     base = (stdout, stderr, code)
     if not include_usage:
         return RunResult(base, metadata)
     if usage_record is None:
         return RunResult(base + (None,), metadata)
-    from dataclasses import asdict
     return RunResult(base + (asdict(usage_record),), metadata)
 
 
 def _model_id(argv):
-    for flag in ("--model", "-m"):
-        try:
-            index = argv.index(flag)
-        except ValueError:
-            continue
-        if index + 1 < len(argv):
+    for index, argument in enumerate(argv):
+        if argument in {"--model", "-m"} and index + 1 < len(argv):
             return argv[index + 1]
+        if argument.startswith("--model="):
+            return argument.partition("=")[2] or providers.detect_provider(argv)
     return providers.detect_provider(argv)
 
 
@@ -384,6 +488,6 @@ def _optional_cap(name, value):
 
 
 __all__ = [
-    "DEFAULT_MAX_INPUT_CHARS", "DEFAULT_MAX_OUTPUT_CHARS", "RunResult",
-    "fail_phase", "run_cli", "run_parallel",
+    "COST_BUDGET_EXIT_CODE", "DEFAULT_MAX_INPUT_CHARS",
+    "DEFAULT_MAX_OUTPUT_CHARS", "RunResult", "fail_phase", "run_cli", "run_parallel",
 ]
