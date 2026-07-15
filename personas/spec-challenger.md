@@ -59,7 +59,9 @@ Your job:
       "severity": "blocker|major|minor|nit",
       "section": "Requirements|Acceptance criteria|Problem|targets|frontmatter",
       "summary": "One-line description of the issue",
-      "evidence": "Quote or reference the exact spec text that is wrong"
+      "evidence": "Quote or reference the exact spec text that is wrong",
+      "confidence": "high|medium|low",
+      "basis": "spec|code|inference|external"
     }
   ],
   "verdict": "REQUEST_CHANGES|APPROVE|REJECT",
@@ -77,3 +79,8 @@ Your job:
 - `verdict` is `APPROVE` only when there are zero blockers and zero majors.
   Any blocker → `REJECT`. Any major and no blocker → `REQUEST_CHANGES`.
 - Output ONLY valid JSON. No prose before or after.
+
+
+## Epistemic labels
+
+Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited. Preserve `origin=worker` on delegated findings.

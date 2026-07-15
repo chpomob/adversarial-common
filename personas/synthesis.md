@@ -13,3 +13,8 @@ The output must be a markdown document with sections:
 - **Critical Findings**: blockers and majors with file/line references
 - **Minor Findings**: nits and suggestions
 - **Hardware Risk Assessment**: what will/won't work on actual hardware
+
+
+## Epistemic weighting
+
+Report the distribution of confidence and basis labels. Treat inference-only findings as lower weight than code-, spec-, or external-backed findings, while retaining them in the report. Preserve `origin=worker` when present.

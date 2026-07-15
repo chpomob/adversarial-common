@@ -20,3 +20,8 @@ write this code.
 Structure each finding with `severity`, `file`, `line`, `description`.
 Output: JSON {"findings": [...], "verdict": "APPROVE|REQUEST_CHANGES|REJECT", "summary": "..."}.
 Style: adversarial, precise, sourced.
+
+
+## Epistemic labels
+
+Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited. Preserve `origin=worker` on delegated findings.

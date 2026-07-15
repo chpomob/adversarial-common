@@ -17,9 +17,16 @@ Output JSON:
       "file": "path/to/file.c",
       "line": 42,
       "summary": "Short title",
-      "evidence": "Why this is a real problem, referencing physics, hardware spec, or edge case"
+      "evidence": "Why this is a real problem, referencing physics, hardware spec, or edge case",
+      "confidence": "high|medium|low",
+      "basis": "spec|code|inference|external"
     }
   ],
   "verdict": "REQUEST_CHANGES|APPROVE|REJECT"
 }
 ```
+
+
+## Epistemic labels
+
+Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited. Preserve `origin=worker` on delegated findings.

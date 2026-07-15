@@ -1,22 +1,24 @@
-"""Shared engine for the adversarial-code-loop and adversarial-code-review skills.
-
-Modules:
-  runner    — hardened subprocess execution (Popen + temp-file IO + killpg)
-  jsonio    — JSON extraction, artifact save/resume, final.json emission
-  providers — provider detection, persona injection, project-access flags
-  snapshot  — git working-tree baseline snapshot
-
-Personas live as plain-text files in ../personas/ and are the single source
-of truth — SKILL.md links to them, scripts load them at runtime.
-"""
+"""Shared engine for the adversarial skill suite."""
 
 from pathlib import Path
+
+from .costs import CostLedger, UsageRecord
+from .gates import (
+    check_context,
+    enforce_input_cap,
+    enforce_output_cap,
+    estimate_complexity,
+    post_build_gate,
+    post_fix_gate,
+    pre_build_gate,
+)
+
 
 PERSONAS_DIR = Path(__file__).resolve().parent.parent / "personas"
 
 
 def persona_path(name):
-    """Absolute path to a persona file (e.g. 'builder' -> personas/builder.md)."""
+    """Return the absolute path to a named persona file."""
     path = PERSONAS_DIR / f"{name}.md"
     if not path.is_file():
         raise FileNotFoundError(f"Persona not found: {path}")
@@ -24,5 +26,13 @@ def persona_path(name):
 
 
 def load_persona(name):
-    """Return the persona text for `name`."""
+    """Return the text of a named persona."""
     return Path(persona_path(name)).read_text()
+
+
+__all__ = [
+    "CostLedger", "PERSONAS_DIR", "UsageRecord", "check_context",
+    "enforce_input_cap", "enforce_output_cap", "estimate_complexity",
+    "load_persona", "persona_path", "post_build_gate", "post_fix_gate",
+    "pre_build_gate",
+]

@@ -1,31 +1,29 @@
-"""JSON extraction and artifact handling shared by both adversarial pipelines.
+"""JSON extraction, finding normalization, and artifact handling."""
 
-Includes YAML frontmatter parsing (requires PyYAML), structured text extraction,
-and artifact management for the adversarial-review/loop/plan/spec pipelines.
-"""
 import json
 import re
 from pathlib import Path
 
-import yaml  # hard dependency — no try/except fallback
+import yaml
+
+from .gates import TRUNCATION_MARKER
+
+
+VALID_CONFIDENCE = frozenset({"high", "medium", "low"})
+VALID_BASIS = frozenset({"spec", "code", "inference", "external"})
 
 
 def strip_json_wrapper(text):
-    """Strip markdown code fences / prose preamble from LLM JSON output.
-
-    Models often wrap JSON in ```json fences or precede it with prose.
-    Returns the largest valid JSON object found in the text (canonicalized),
-    or the original text when no JSON object can be decoded.
-    """
+    """Strip markdown fences/prose and return the largest JSON object text."""
     if not text:
         return text
-    cleaned = re.sub(r'```(?:json)?\s*\n?', '', text)
-    cleaned = re.sub(r'\n?```', '', cleaned)
+    cleaned = re.sub(r"```(?:json)?\s*\n?", "", text)
+    cleaned = re.sub(r"\n?```", "", cleaned)
     candidates = []
     pos = 0
     decoder = json.JSONDecoder()
     while pos < len(cleaned):
-        brace = cleaned.find('{', pos)
+        brace = cleaned.find("{", pos)
         if brace == -1:
             break
         try:
@@ -34,13 +32,11 @@ def strip_json_wrapper(text):
             pos = brace + end
         except json.JSONDecodeError:
             pos = brace + 1
-    if not candidates:
-        return text
-    return max(candidates, key=len)
+    return max(candidates, key=len) if candidates else text
 
 
 def save_artifact(out_dir, name, content):
-    """Write an artifact file under out_dir, creating parents as needed."""
+    """Write an artifact under ``out_dir``, creating parents as needed."""
     path = Path(out_dir) / name
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
@@ -48,7 +44,7 @@ def save_artifact(out_dir, name, content):
 
 
 def resume_artifact(out_dir, filename, label):
-    """Return saved artifact text if it exists and is non-empty (for --resume)."""
+    """Return a saved non-empty artifact for a resumed phase."""
     path = Path(out_dir) / filename
     if path.is_file():
         text = path.read_text()
@@ -59,69 +55,108 @@ def resume_artifact(out_dir, filename, label):
 
 
 def write_final_json(out_dir, verdict, **extra):
-    """Write the machine-readable final.json verdict artifact.
-
-    Orchestrators (CI, cron) should consume this instead of parsing exit codes
-    or stdout. `extra` fields are merged into the JSON object.
-    """
+    """Write the authoritative machine-readable final verdict artifact."""
     payload = {"verdict": verdict}
     payload.update(extra)
     return save_artifact(out_dir, "final.json", json.dumps(payload, indent=2) + "\n")
 
 
-# ---------------------------------------------------------------------------
-# 3-strategy JSON extraction (Item 5)
-# ---------------------------------------------------------------------------
-
-def parse_json_output(text: str) -> dict | list | None:
-    """Parse JSON from model output, trying multiple extraction strategies.
-
-    1. strip markdown code fences (```json ... ```)
-    2. ``json.loads`` on the whole text
-    3. extract the outermost ``{ ... }`` object, then the outermost ``[ ... ]``
-       array
-
-    Returns the parsed object or ``None`` when nothing decodes.
-    """
+def parse_json_output(text: str, warnings: list | None = None) -> dict | list | None:
+    """Parse model JSON, rejecting truncated output and normalizing findings."""
     if not isinstance(text, str) or not text.strip():
         return None
-    text = text.strip()
-
-    # Strategy 1: markdown fence wrapper.
-    if text.startswith("```"):
-        text = "\n".join(
-            line for line in text.splitlines()
+    if TRUNCATION_MARKER in text:
+        if warnings is not None:
+            warnings.append({
+                "code": "truncated_json_output",
+                "message": "provider output was truncated before JSON parsing",
+            })
+        return None
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = "\n".join(
+            line for line in candidate.splitlines()
             if not line.strip().startswith("```")
         ).strip()
-
-    for _name, parse_fn in (
-        ("json.loads", lambda t: json.loads(t)),
-        ("extract { }",
-         lambda t: json.loads(t[t.find("{"):t.rfind("}") + 1]) if "{" in t else None),
-        ("extract [ ]",
-         lambda t: json.loads(t[t.find("["):t.rfind("]") + 1]) if "[" in t else None),
+    result = None
+    for parse_fn in (
+        lambda value: json.loads(value),
+        lambda value: json.loads(value[value.find("{"):value.rfind("}") + 1])
+        if "{" in value else None,
+        lambda value: json.loads(value[value.find("["):value.rfind("]") + 1])
+        if "[" in value else None,
     ):
         try:
-            result = parse_fn(text)
+            result = parse_fn(candidate)
             if result is not None:
-                return result
+                break
         except (json.JSONDecodeError, ValueError, IndexError):
             continue
-    return None
+    if result is None:
+        return None
+    return normalize_findings(result, warnings=warnings)
 
 
-# ---------------------------------------------------------------------------
-# Frontmatter parsing (Items 6, 8)
-# ---------------------------------------------------------------------------
+def normalize_findings(payload, warnings: list | None = None):
+    """Normalize finding epistemic labels in place without dropping findings."""
+    root = payload if isinstance(payload, dict) else None
+    if isinstance(payload, dict):
+        findings = payload.get("findings")
+        if not isinstance(findings, list):
+            return payload
+    elif isinstance(payload, list):
+        findings = payload
+    else:
+        return payload
+    recorded = warnings if warnings is not None else []
+    for index, finding in enumerate(findings):
+        if not isinstance(finding, dict):
+            continue
+        confidence = finding.get("confidence")
+        basis = finding.get("basis")
+        if confidence not in VALID_CONFIDENCE or basis not in VALID_BASIS:
+            finding["confidence"] = "low"
+            finding["basis"] = "inference"
+            warning = {
+                "code": "epistemic_label_defaulted",
+                "finding_id": str(finding.get("id", index)),
+                "message": "missing or invalid confidence/basis normalized to low/inference",
+            }
+            recorded.append(warning)
+            finding.setdefault("warnings", []).append(warning["code"])
+    if root is not None and recorded:
+        root_warnings = root.setdefault("warnings", [])
+        for warning in recorded:
+            if warning not in root_warnings:
+                root_warnings.append(warning)
+    return payload
 
-# Frontmatter = a leading '---' line, a block, then a closing '---' line.
-_FRONTMATTER_RE = re.compile(
-    r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.DOTALL
-)
+
+def epistemic_distribution(findings) -> dict:
+    """Count confidence, basis, and combined labels for synthesis/final JSON."""
+    distribution = {
+        "confidence": {name: 0 for name in sorted(VALID_CONFIDENCE)},
+        "basis": {name: 0 for name in sorted(VALID_BASIS)},
+        "combined": {},
+    }
+    normalized = normalize_findings(list(findings))
+    for finding in normalized:
+        if not isinstance(finding, dict):
+            continue
+        confidence = finding["confidence"]
+        basis = finding["basis"]
+        distribution["confidence"][confidence] += 1
+        distribution["basis"][basis] += 1
+        key = f"{confidence}/{basis}"
+        distribution["combined"][key] = distribution["combined"].get(key, 0) + 1
+    return distribution
+
+
+_FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n(.*?)\n---[ \t]*(?:\n|\Z)", re.DOTALL)
 
 
 def extract_frontmatter(text: str) -> str | None:
-    """Return the raw YAML frontmatter block of *text*, or None."""
+    """Return the raw YAML frontmatter block, if present."""
     if not isinstance(text, str):
         return None
     match = _FRONTMATTER_RE.match(text.lstrip("\ufeff"))
@@ -129,12 +164,7 @@ def extract_frontmatter(text: str) -> str | None:
 
 
 def parse_frontmatter(fm_text: str) -> tuple[dict | None, str | None]:
-    """Parse a frontmatter block. Returns ``(mapping_or_None, error_or_None)``.
-
-    Always uses PyYAML (hard dependency since Item 8). The fragile regex
-    fallback has been removed — nested structures and YAML lists are now
-    correctly parsed.
-    """
+    """Parse YAML frontmatter into ``(mapping, error)``."""
     try:
         data = yaml.safe_load(fm_text)
     except yaml.YAMLError as exc:
@@ -142,3 +172,11 @@ def parse_frontmatter(fm_text: str) -> tuple[dict | None, str | None]:
     if not isinstance(data, dict):
         return None, "frontmatter is not a YAML mapping"
     return data, None
+
+
+__all__ = [
+    "VALID_BASIS", "VALID_CONFIDENCE", "epistemic_distribution",
+    "extract_frontmatter", "normalize_findings", "parse_frontmatter",
+    "parse_json_output", "resume_artifact", "save_artifact",
+    "strip_json_wrapper", "write_final_json",
+]

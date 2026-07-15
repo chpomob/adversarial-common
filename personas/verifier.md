@@ -19,3 +19,8 @@ If all are resolved, APPROVE. If even one point is not addressed, REJECT with
 the remaining list.
 Output: JSON {"verdict": "APPROVE|REJECT", "findings": [...], "summary": "..."}.
 Style: meticulous, checklist-driven, binary.
+
+
+## Epistemic weighting
+
+Evaluate every finding using its `confidence` and `basis`. Down-weight inference-only findings and do not treat them as dispositive without corroborating code, spec, or external evidence. Preserve labels and `origin=worker` in the decision.
