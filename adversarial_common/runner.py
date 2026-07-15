@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shlex
 import signal
 import subprocess
@@ -13,6 +14,7 @@ import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict
 from typing import Any
 
@@ -21,6 +23,56 @@ from . import costs, gates, providers
 
 DEFAULT_MAX_INPUT_CHARS = 256 * 1024
 DEFAULT_MAX_OUTPUT_CHARS = 128 * 1024
+# Stable process exit codes for opt-in CI mode.  These values are a public
+# contract shared by all pipeline entry points; do not derive them from a
+# provider's return code.
+CI_EXIT_CLEAN = 0
+CI_EXIT_INFRASTRUCTURE = 1
+CI_EXIT_BLOCKING = 2
+CI_EXIT_NON_BLOCKING = 3
+CI_EXIT_CONTEXT_BLOCKED = 5
+
+DEFAULT_RESEARCH_MAX_QUERIES = 5
+DEFAULT_RESEARCH_MAX_RESULTS = 5
+DEFAULT_RESEARCH_TIMEOUT = 60
+DEFAULT_RESEARCH_MAX_INPUT_CHARS = 16 * 1024
+DEFAULT_RESEARCH_MAX_OUTPUT_CHARS = 32 * 1024
+
+_ANSI_ESCAPE_RE = re.compile(
+    r"(?:\x1B\[[0-?]*[ -/]*[@-~]|\x1B\][^\x07]*(?:\x07|\x1B\\))"
+)
+_CI_PASS_VERDICTS = frozenset({
+    "accept", "accepted", "approve", "approved", "clean", "ok", "pass",
+    "passed", "resolved", "success", "succeeded",
+})
+_CI_BLOCKING_VERDICTS = frozenset({
+    "block", "blocked", "blocking", "fail", "failed", "reject", "rejected",
+    "request_changes", "requested_changes",
+})
+_CI_INFRA_VERDICTS = frozenset({
+    "error", "infra", "infra_error", "infrastructure",
+    "infrastructure_error", "unavailable",
+})
+_CI_CONTEXT_VERDICTS = frozenset({
+    "context_block", "context_blocked", "insufficient_context",
+})
+_CI_NON_BLOCKING_VERDICTS = frozenset({
+    "approve_with_findings", "findings", "non_blocking", "warn", "warning",
+})
+_SEVERITIES = frozenset({"blocker", "major", "minor", "nit"})
+_BLOCKING_SEVERITIES = frozenset({"blocker", "major"})
+_CONFIDENCE_LEVELS = frozenset({"high", "medium", "low"})
+_BASIS_TYPES = frozenset({"spec", "code", "inference", "external"})
+_FAIL_ON_KINDS = {
+    "verdict": (
+        _CI_PASS_VERDICTS | _CI_BLOCKING_VERDICTS | _CI_INFRA_VERDICTS
+        | _CI_CONTEXT_VERDICTS | _CI_NON_BLOCKING_VERDICTS
+    ),
+    "severity": _SEVERITIES,
+    "confidence": _CONFIDENCE_LEVELS,
+    "basis": _BASIS_TYPES,
+}
+
 COST_BUDGET_EXIT_CODE = 3
 
 
@@ -33,6 +85,418 @@ class RunResult(tuple):
         instance = super().__new__(cls, values)
         instance.metadata = metadata if metadata is not None else {}
         return instance
+
+
+class _AnsiStrippingStream:
+    """Minimal text stream that removes terminal controls from CI diagnostics."""
+
+    def __init__(self, target):
+        self._target = target
+
+    def write(self, text):
+        return self._target.write(_ANSI_ESCAPE_RE.sub("", str(text)))
+
+    def flush(self):
+        return self._target.flush()
+
+    def isatty(self):
+        return False
+
+    @property
+    def encoding(self):
+        return getattr(self._target, "encoding", "utf-8")
+
+
+@contextmanager
+def ci_mode(enabled=True, *, stderr=None):
+    """Route human stdout to plain-text stderr while CI mode is active.
+
+    The helper deliberately does not alter global print or logging state.
+    It redirects only the current context, making the disabled path a true
+    no-op and allowing machine artifacts to remain the source of truth.
+    """
+    if not enabled:
+        yield sys.stdout
+        return
+    target = sys.stderr if stderr is None else stderr
+    stream = _AnsiStrippingStream(target)
+    with redirect_stdout(stream):
+        yield stream
+
+
+def ci_print(*values, enabled=True, file=None, **kwargs):
+    """Print a human diagnostic using CI stdout discipline."""
+    target = (sys.stderr if file is None else file) if enabled else file
+    if enabled:
+        text = kwargs.pop("sep", " ").join(str(value) for value in values)
+        end = kwargs.pop("end", "\n")
+        if kwargs:
+            print(_ANSI_ESCAPE_RE.sub("", text), end=end, file=target, **kwargs)
+        else:
+            target.write(_ANSI_ESCAPE_RE.sub("", text + end))
+        return
+    print(*values, file=target, **kwargs)
+
+
+def parse_fail_on(selector=None):
+    """Parse a strict, deterministic --fail-on selector.
+
+    Selectors are comma-separated and combined with OR semantics. Supported
+    shorthands are findings, blocking, non-blocking, confidence names,
+    severities, and basis names. Typed forms include verdict:reject,
+    severity:major, confidence:high, and basis:external. The none or never
+    selector disables findings-based failure.
+    """
+    if selector is None:
+        return frozenset({"findings"})
+    if isinstance(selector, str):
+        raw_tokens = selector.split(",")
+    elif isinstance(selector, (Sequence, set, frozenset)) and not isinstance(
+        selector, (bytes, bytearray)
+    ):
+        raw_tokens = []
+        for value in selector:
+            if not isinstance(value, str):
+                raise TypeError("fail-on selectors must be strings")
+            raw_tokens.extend(value.split(","))
+    else:
+        raise TypeError("fail-on selector must be a string collection")
+
+    parsed = set()
+    for raw_token in raw_tokens:
+        token = _policy_name(raw_token)
+        if token == "nonblocking":
+            token = "non_blocking"
+        if not token:
+            raise ValueError("fail-on selector contains an empty value")
+        if token in {"none", "never"}:
+            if len(raw_tokens) != 1:
+                raise ValueError("'none'/'never' cannot be combined with selectors")
+            return frozenset()
+        if token in {"all", "any", "findings"}:
+            parsed.add("findings")
+            continue
+        if token in {"blocking", "non_blocking"}:
+            parsed.add(token)
+            continue
+        if token in _CONFIDENCE_LEVELS:
+            parsed.add(f"confidence:{token}")
+            continue
+        if token in _SEVERITIES:
+            parsed.add(f"severity:{token}")
+            continue
+        if token in _BASIS_TYPES:
+            parsed.add(f"basis:{token}")
+            continue
+        kind, separator, value = token.partition(":")
+        value = _policy_name(value)
+        allowed = _FAIL_ON_KINDS.get(kind)
+        if not separator or allowed is None or value not in allowed:
+            raise ValueError(f"unsupported fail-on selector: {raw_token!r}")
+        parsed.add(f"{kind}:{value}")
+    if not parsed:
+        raise ValueError("fail-on selector must not be empty")
+    return frozenset(parsed)
+
+
+def ci_exit_code(
+    verdict,
+    epistemic=None,
+    fail_on_selector=None,
+    blocked=False,
+    *,
+    severity=None,
+    findings=None,
+    infrastructure=False,
+    context_blocked=False,
+):
+    """Return the stable CI exit code for a final outcome.
+
+    Operational failures are never suppressed by --fail-on: infrastructure
+    maps to 1 and insufficient context to 5. Findings selected by policy map
+    to 2 when blocking (blocker/major or a blocking verdict), otherwise to 3.
+    A clean or policy-excluded outcome maps to 0.
+    """
+    payload = verdict if isinstance(verdict, Mapping) else None
+    if payload is not None:
+        verdict = payload.get("verdict", payload.get("status", "unknown"))
+        if findings is None:
+            findings = payload.get("findings")
+        if epistemic is None:
+            epistemic = payload.get(
+                "epistemic", payload.get("label_distribution")
+            )
+        if severity is None:
+            severity = payload.get("severity")
+        infrastructure = infrastructure or _truthy_outcome(
+            payload.get("infrastructure")
+        )
+        context_blocked = context_blocked or _truthy_outcome(
+            payload.get("context_blocked")
+        )
+        context = payload.get("context")
+        if isinstance(context, Mapping):
+            context_blocked = context_blocked or context.get("ok") is False
+        status = _policy_name(payload.get("status", ""))
+        infrastructure = infrastructure or status in _CI_INFRA_VERDICTS
+        context_blocked = context_blocked or status in _CI_CONTEXT_VERDICTS
+
+    normalized_verdict = _policy_name(verdict)
+    if context_blocked or blocked or normalized_verdict in _CI_CONTEXT_VERDICTS:
+        return CI_EXIT_CONTEXT_BLOCKED
+    if infrastructure or normalized_verdict in _CI_INFRA_VERDICTS:
+        return CI_EXIT_INFRASTRUCTURE
+
+    policy = parse_fail_on(fail_on_selector)
+    if not policy:
+        return CI_EXIT_CLEAN
+    facts = _ci_finding_facts(findings)
+    facts.extend(_ci_finding_facts(epistemic))
+    facts.extend(_severity_facts(severity))
+
+    matched = [
+        fact for fact in facts
+        if _finding_matches_policy(fact, policy, normalized_verdict)
+    ]
+    verdict_selected = f"verdict:{normalized_verdict}" in policy
+    class_selected = (
+        "blocking" in policy
+        and normalized_verdict in _CI_BLOCKING_VERDICTS
+    ) or (
+        "non_blocking" in policy
+        and normalized_verdict in _CI_NON_BLOCKING_VERDICTS
+    )
+    implicit_verdict = (
+        "findings" in policy
+        and normalized_verdict in (
+            _CI_BLOCKING_VERDICTS | _CI_NON_BLOCKING_VERDICTS
+        )
+    )
+    if (
+        not matched
+        and not verdict_selected
+        and not class_selected
+        and not implicit_verdict
+    ):
+        if normalized_verdict not in (
+            _CI_PASS_VERDICTS | _CI_BLOCKING_VERDICTS
+            | _CI_NON_BLOCKING_VERDICTS | {""}
+        ):
+            return CI_EXIT_INFRASTRUCTURE
+        return CI_EXIT_CLEAN
+
+    blocking = any(
+        fact.get("severity") in _BLOCKING_SEVERITIES for fact in matched
+    )
+    if (
+        normalized_verdict in _CI_BLOCKING_VERDICTS
+        and (
+            verdict_selected
+            or class_selected
+            or implicit_verdict
+            or matched
+        )
+    ):
+        blocking = True
+    return CI_EXIT_BLOCKING if blocking else CI_EXIT_NON_BLOCKING
+
+
+def ensure_final_payload(
+    payload=None,
+    *,
+    verdict=None,
+    findings=None,
+    infrastructure=None,
+    context=None,
+    **extra,
+):
+    """Return a complete, JSON-serializable final payload without mutation."""
+    if payload is None:
+        result = {}
+    elif isinstance(payload, Mapping):
+        result = dict(payload)
+    else:
+        raise TypeError("payload must be a mapping or None")
+    if verdict is not None:
+        result["verdict"] = verdict
+    result.setdefault("verdict", "UNKNOWN")
+
+    source_findings = findings if findings is not None else result.get("findings", [])
+    if source_findings is None:
+        source_findings = []
+    if not isinstance(source_findings, Sequence) or isinstance(
+        source_findings, (str, bytes, bytearray)
+    ):
+        raise TypeError("findings must be a sequence")
+    result["findings"] = [
+        dict(item) if isinstance(item, Mapping) else item
+        for item in source_findings
+    ]
+    if infrastructure is not None:
+        result["infrastructure"] = infrastructure
+    if context is not None:
+        result["context"] = context
+    result.update(extra)
+
+    normalized = _policy_name(result["verdict"])
+    context_value = result.get("context")
+    known_verdicts = (
+        _CI_PASS_VERDICTS | _CI_BLOCKING_VERDICTS | _CI_INFRA_VERDICTS
+        | _CI_CONTEXT_VERDICTS | _CI_NON_BLOCKING_VERDICTS
+    )
+    is_context_block = (
+        normalized in _CI_CONTEXT_VERDICTS
+        or _truthy_outcome(result.get("context_blocked"))
+        or (
+            isinstance(context_value, Mapping)
+            and context_value.get("ok") is False
+        )
+    )
+    is_infra = (
+        normalized in _CI_INFRA_VERDICTS
+        or _truthy_outcome(result.get("infrastructure"))
+        or normalized not in known_verdicts
+    )
+    if is_context_block:
+        result["status"] = "context_blocked"
+    elif is_infra:
+        result["status"] = "infrastructure_error"
+    elif result["findings"] or normalized in (
+        _CI_BLOCKING_VERDICTS | _CI_NON_BLOCKING_VERDICTS
+    ):
+        result["status"] = "findings"
+    else:
+        result["status"] = "clean"
+    return result
+
+
+build_final_payload = ensure_final_payload
+
+
+def _policy_name(value):
+    if value is None:
+        return ""
+    return re.sub(r"[-\s]+", "_", str(value).strip().casefold())
+
+
+def _truthy_outcome(value):
+    if isinstance(value, Mapping):
+        return value.get("ok") is False or bool(value.get("error"))
+    return bool(value)
+
+
+def _ci_finding_facts(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = _policy_name(value)
+        for kind, allowed in (
+            ("severity", _SEVERITIES),
+            ("confidence", _CONFIDENCE_LEVELS),
+            ("basis", _BASIS_TYPES),
+        ):
+            if normalized in allowed:
+                return [{kind: normalized}]
+        return []
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        facts = []
+        for item in value:
+            facts.extend(_ci_finding_facts(item))
+        return facts
+    if not isinstance(value, Mapping):
+        return []
+
+    nested = value.get("findings")
+    if isinstance(nested, Sequence) and not isinstance(
+        nested, (str, bytes, bytearray)
+    ):
+        return _ci_finding_facts(nested)
+
+    fact = {}
+    for kind, allowed in (
+        ("severity", _SEVERITIES),
+        ("confidence", _CONFIDENCE_LEVELS),
+        ("basis", _BASIS_TYPES),
+    ):
+        field = value.get(kind)
+        if isinstance(field, str):
+            normalized = _policy_name(field)
+            if normalized in allowed:
+                fact[kind] = normalized
+    facts = [fact] if fact else []
+    for kind, allowed in (
+        ("severity", _SEVERITIES),
+        ("confidence", _CONFIDENCE_LEVELS),
+        ("basis", _BASIS_TYPES),
+    ):
+        distribution = value.get(kind)
+        if isinstance(distribution, Mapping):
+            for label, count in distribution.items():
+                normalized = _policy_name(label)
+                if normalized in allowed and _positive_count(count):
+                    facts.append({kind: normalized})
+    if not facts:
+        keys = {_policy_name(key) for key in value}
+        for kind, allowed in (
+            ("severity", _SEVERITIES),
+            ("confidence", _CONFIDENCE_LEVELS),
+            ("basis", _BASIS_TYPES),
+        ):
+            for label in keys & allowed:
+                if _positive_count(value.get(label)):
+                    facts.append({kind: label})
+    return facts
+
+
+def _severity_facts(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        normalized = _policy_name(value)
+        return [{"severity": normalized}] if normalized in _SEVERITIES else []
+    if isinstance(value, Mapping):
+        return [
+            {"severity": normalized}
+            for label, count in value.items()
+            if (normalized := _policy_name(label)) in _SEVERITIES
+            and _positive_count(count)
+        ]
+    if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        return [
+            fact
+            for item in value
+            for fact in _severity_facts(item)
+        ]
+    return []
+
+
+def _positive_count(value):
+    return value is not None and value is not False and (
+        not isinstance(value, (int, float)) or value > 0
+    )
+
+
+def _finding_matches_policy(fact, policy, verdict):
+    if "findings" in policy:
+        return True
+    severity = fact.get("severity")
+    if "blocking" in policy and (
+        severity in _BLOCKING_SEVERITIES
+        or (severity is None and verdict in _CI_BLOCKING_VERDICTS)
+    ):
+        return True
+    if "non_blocking" in policy and (
+        severity not in _BLOCKING_SEVERITIES
+        and verdict not in _CI_BLOCKING_VERDICTS
+    ):
+        return True
+    return any(
+        f"{kind}:{fact[kind]}" in policy
+        for kind in ("severity", "confidence", "basis")
+        if kind in fact
+    )
 
 
 def run_cli(
@@ -259,6 +723,313 @@ def run_cli(
     return _result(
         stdout, stderr, returncode, usage_record, include_usage, metadata
     )
+
+
+def run_research(
+    queries,
+    provider_cmd=None,
+    *,
+    enabled=False,
+    command=None,
+    provider_command=None,
+    max_queries=DEFAULT_RESEARCH_MAX_QUERIES,
+    max_results=DEFAULT_RESEARCH_MAX_RESULTS,
+    timeout=DEFAULT_RESEARCH_TIMEOUT,
+    max_input_chars=DEFAULT_RESEARCH_MAX_INPUT_CHARS,
+    max_output_chars=DEFAULT_RESEARCH_MAX_OUTPUT_CHARS,
+    ledger=None,
+    budget=None,
+    model=None,
+    max_completion_tokens=None,
+    cwd=None,
+    log=None,
+    stderr=None,
+    env=None,
+):
+    """Run opt-in, bounded external research through a configured provider.
+
+    Disabled mode returns None before inspecting inputs or configuration. This
+    lets callers omit the research field entirely and preserves legacy output
+    byte-for-byte. Enabled failures are represented as non-fatal skip records
+    and are also logged to stderr.
+    """
+    if not enabled:
+        return None
+
+    query_limit = _positive_int("max_queries", max_queries)
+    result_limit = _non_negative_int("max_results", max_results)
+    input_limit = _positive_int("max_input_chars", max_input_chars)
+    output_limit = _positive_int("max_output_chars", max_output_chars)
+    timeout_value = _non_negative_number("timeout", timeout)
+    if timeout_value <= 0:
+        raise ValueError("timeout must be positive")
+    if env is not None and not isinstance(env, Mapping):
+        raise TypeError("env must be a mapping or None")
+
+    configured = [
+        value for value in (provider_cmd, command, provider_command)
+        if value is not None
+    ]
+    if len(configured) > 1 and any(value != configured[0] for value in configured[1:]):
+        raise ValueError("research provider command was configured more than once")
+    provider_cmd = configured[0] if configured else (
+        os.environ if env is None else env
+    ).get("ADVERSARIAL_RESEARCH_CMD")
+    if not provider_cmd:
+        return _research_skip(
+            "research provider command is not configured",
+            log=log,
+            stderr=stderr,
+        )
+    if budget is not None and ledger is None:
+        return _research_skip(
+            "research budget requires a shared CostLedger",
+            log=log,
+            stderr=stderr,
+        )
+
+    if isinstance(queries, str):
+        requested_queries = [queries]
+    elif isinstance(queries, Sequence) and not isinstance(
+        queries, (bytes, bytearray)
+    ):
+        requested_queries = list(queries)
+    else:
+        raise TypeError("queries must be a string or sequence of strings")
+    if any(not isinstance(query, str) for query in requested_queries):
+        raise TypeError("research queries must be strings")
+
+    selected_queries = requested_queries[:query_limit]
+    warnings = []
+    if len(requested_queries) > query_limit:
+        warnings.append({
+            "code": "research_query_limit",
+            "message": (
+                f"research queries capped at {query_limit}; "
+                f"{len(requested_queries) - query_limit} omitted"
+            ),
+        })
+    response = {
+        "enabled": True,
+        "status": "complete",
+        "non_fatal": True,
+        "queries_requested": len(requested_queries),
+        "queries_run": 0,
+        "result_count": 0,
+        "limits": {
+            "queries": query_limit,
+            "results": result_limit,
+            "input_chars": input_limit,
+            "output_chars": output_limit,
+            "timeout": timeout_value,
+        },
+        "findings": [],
+        "calls": [],
+        "warnings": warnings,
+    }
+    if result_limit == 0 or not selected_queries:
+        return response
+
+    completion_limit = max_completion_tokens
+    if budget is not None and completion_limit is None:
+        completion_limit = (output_limit + 3) // 4
+    output_remaining = output_limit
+
+    for query_index, query in enumerate(selected_queries, start=1):
+        if len(response["findings"]) >= result_limit or output_remaining <= 0:
+            break
+        bounded_query, input_truncated = gates.enforce_input_cap(query, input_limit)
+        if input_truncated:
+            warnings.append({
+                "code": "research_input_truncated",
+                "query": query_index,
+                "message": f"research query {query_index} exceeded the input cap",
+            })
+
+        try:
+            result = run_cli(
+                provider_cmd,
+                stdin_text=bounded_query,
+                timeout=timeout_value,
+                cwd=cwd,
+                ledger=ledger,
+                budget=budget,
+                model=model,
+                phase="research",
+                persona="research",
+                max_completion_tokens=completion_limit,
+                max_retries=0,
+                max_input_chars=input_limit,
+                max_output_chars=output_remaining,
+                truncate_input=True,
+            )
+        except Exception as exc:
+            reason = f"research provider error: {type(exc).__name__}: {exc}"
+            _record_research_failure(response, reason, log, stderr)
+            break
+
+        try:
+            stdout, provider_stderr, returncode = result[:3]
+        except (TypeError, ValueError) as exc:
+            reason = f"research provider returned an invalid result: {exc}"
+            _record_research_failure(response, reason, log, stderr)
+            break
+        stdout = stdout if isinstance(stdout, str) else str(stdout)
+        provider_stderr = (
+            provider_stderr if isinstance(provider_stderr, str)
+            else str(provider_stderr)
+        )
+        bounded_stdout, output_truncated = gates.enforce_output_cap(
+            stdout, output_remaining
+        )
+        bounded_stderr, stderr_truncated = gates.enforce_output_cap(
+            provider_stderr, output_limit
+        )
+        call = {
+            "query": query_index,
+            "returncode": returncode,
+            "stdout": bounded_stdout,
+            "stderr": bounded_stderr,
+        }
+        metadata = getattr(result, "metadata", None)
+        if isinstance(metadata, Mapping):
+            call["metadata"] = _json_safe(metadata)
+        response["calls"].append(call)
+        response["queries_run"] += 1
+
+        if output_truncated:
+            warnings.append({
+                "code": "research_output_truncated",
+                "query": query_index,
+                "message": f"research output exceeded the {output_limit}-character cap",
+            })
+        if stderr_truncated:
+            warnings.append({
+                "code": "research_stderr_truncated",
+                "query": query_index,
+                "message": "research provider stderr was truncated",
+            })
+        output_remaining -= len(bounded_stdout)
+
+        if returncode != 0:
+            if (
+                returncode == COST_BUDGET_EXIT_CODE
+                and isinstance(metadata, Mapping)
+                and metadata.get("budget_exceeded")
+            ):
+                reason = "research skipped because the cost budget was exhausted"
+            elif returncode == 127:
+                reason = "research provider is unavailable"
+            else:
+                detail = bounded_stderr.strip() or f"exit code {returncode}"
+                reason = f"research provider failed: {detail}"
+            _record_research_failure(response, reason, log, stderr)
+            break
+
+        items = _research_result_items(bounded_stdout)
+        available = result_limit - len(response["findings"])
+        for item in items[:available]:
+            response["findings"].append(
+                _external_research_finding(item, bounded_query)
+            )
+        if len(items) > available:
+            warnings.append({
+                "code": "research_result_limit",
+                "query": query_index,
+                "message": f"research results capped at {result_limit}",
+            })
+            break
+
+    response["result_count"] = len(response["findings"])
+    return response
+
+
+def _record_research_failure(response, reason, log, stderr):
+    response["status"] = "partial" if response["findings"] else "skipped"
+    response["reason"] = reason
+    _emit_research_skip(reason, log=log, stderr=stderr)
+
+
+def _research_skip(reason, *, log, stderr):
+    _emit_research_skip(reason, log=log, stderr=stderr)
+    return {
+        "enabled": True,
+        "status": "skipped",
+        "non_fatal": True,
+        "reason": reason,
+        "queries_requested": 0,
+        "queries_run": 0,
+        "result_count": 0,
+        "findings": [],
+        "calls": [],
+        "warnings": [],
+    }
+
+
+def _emit_research_skip(reason, *, log, stderr):
+    message = f"Research skipped: {reason}"
+    if log is not None:
+        append = getattr(log, "append", None)
+        if callable(append):
+            append(message)
+        elif callable(log):
+            log(message)
+        else:
+            raise TypeError("log must be callable or support append")
+    print(message, file=sys.stderr if stderr is None else stderr)
+
+
+def _research_result_items(text):
+    if not text.strip():
+        return []
+    payload = _decode_json_value(text)
+    if isinstance(payload, Mapping):
+        for key in ("findings", "results", "items", "evidence"):
+            items = payload.get(key)
+            if isinstance(items, Sequence) and not isinstance(
+                items, (str, bytes, bytearray)
+            ):
+                return list(items)
+        return [payload]
+    if isinstance(payload, Sequence) and not isinstance(
+        payload, (str, bytes, bytearray)
+    ):
+        return list(payload)
+    if payload is not None:
+        return [payload]
+    return [text]
+
+
+def _external_research_finding(item, query):
+    if isinstance(item, Mapping):
+        finding = _research_json_safe(item)
+    else:
+        finding = {"evidence": _research_json_safe(item)}
+    if not isinstance(finding, dict):
+        finding = {"evidence": finding}
+    finding["basis"] = "external"
+    confidence = _policy_name(finding.get("confidence"))
+    finding["confidence"] = (
+        confidence if confidence in _CONFIDENCE_LEVELS else "low"
+    )
+    finding.setdefault("origin", "research")
+    finding.setdefault("query", query)
+    return finding
+
+
+def _research_json_safe(value):
+    if isinstance(value, Mapping):
+        return {
+            str(key): _research_json_safe(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return [_research_json_safe(item) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
 
 
 def _execute_attempt(argv, stdin_text, timeout, cwd):
@@ -510,6 +1281,8 @@ def run_delegated(
 
 
 def _invoke_run_cli(call_args):
+    if callable(call_args):
+        return call_args()
     if isinstance(call_args, Mapping):
         return run_cli(**dict(call_args))
     if isinstance(call_args, Sequence) and not isinstance(call_args, (str, bytes)):
@@ -663,7 +1436,7 @@ def _tag_worker_output(record):
     payload = _decode_json_value(record["stdout"])
     if payload is None:
         return
-    _mark_worker_findings(payload, root=True)
+    _mark_worker_findings(payload)
     stdout = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     raw = record["result"]
     metadata = getattr(raw, "metadata", None)
@@ -673,7 +1446,7 @@ def _tag_worker_output(record):
     record["result"] = RunResult(values, metadata)
 
 
-def _mark_worker_findings(value, *, root=False, findings=False):
+def _mark_worker_findings(value, *, findings=False):
     if isinstance(value, Mapping):
         if findings:
             value.setdefault("origin", "worker")
@@ -682,7 +1455,7 @@ def _mark_worker_findings(value, *, root=False, findings=False):
         return
     if isinstance(value, list):
         for item in value:
-            _mark_worker_findings(item, findings=findings or root)
+            _mark_worker_findings(item, findings=findings)
 
 
 def fail_phase(label, code, stderr):
@@ -778,7 +1551,13 @@ def _optional_cap(name, value):
 
 
 __all__ = [
-    "COST_BUDGET_EXIT_CODE", "DEFAULT_MAX_INPUT_CHARS",
-    "DEFAULT_MAX_OUTPUT_CHARS", "RunResult", "fail_phase", "run_cli",
-    "run_delegated", "run_parallel",
+    "CI_EXIT_BLOCKING", "CI_EXIT_CLEAN", "CI_EXIT_CONTEXT_BLOCKED",
+    "CI_EXIT_INFRASTRUCTURE", "CI_EXIT_NON_BLOCKING", "COST_BUDGET_EXIT_CODE",
+    "DEFAULT_MAX_INPUT_CHARS", "DEFAULT_MAX_OUTPUT_CHARS",
+    "DEFAULT_RESEARCH_MAX_INPUT_CHARS", "DEFAULT_RESEARCH_MAX_OUTPUT_CHARS",
+    "DEFAULT_RESEARCH_MAX_QUERIES", "DEFAULT_RESEARCH_MAX_RESULTS",
+    "DEFAULT_RESEARCH_TIMEOUT", "RunResult", "build_final_payload", "ci_exit_code",
+    "ci_mode", "ci_print", "ensure_final_payload", "fail_phase",
+    "parse_fail_on", "run_cli", "run_delegated", "run_parallel",
+    "run_research",
 ]

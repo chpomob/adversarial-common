@@ -135,9 +135,10 @@ def _render_document(payload, final_path, report_path, artifacts):
 
     sections = [
         _render_overview(payload, final_path, report_path),
-        _render_findings(payload.get("findings")),
+        _render_findings(payload.get("finding_details", payload.get("findings"))),
         _render_epistemic(payload),
         _render_costs(payload.get("costs")),
+        _render_execution(payload),
         _render_gates(payload.get("gates")),
         _render_warnings(payload.get("warnings")),
         _render_artifacts(artifacts),
@@ -207,7 +208,10 @@ pre {{ max-height:38rem; margin:0; padding:14px; border-top:1px solid var(--line
 
 
 def _render_overview(payload, final_path, report_path):
-    excluded = {"costs", "epistemic_distribution", "epistemic_labels", "findings", "gates", "warnings"}
+    excluded = {
+        "costs", "delegated", "epistemic_distribution", "epistemic_labels",
+        "finding_details", "findings", "gates", "parallel", "warnings",
+    }
     rows = [
         (key, value) for key, value in payload.items()
         if key not in excluded and key not in {"verdict", "status"}
@@ -298,6 +302,28 @@ def _render_costs(costs):
     else:
         body = f'<pre>{_escaped(_json_text(costs))}</pre>'
     return f'<section class="panel"><h2>Costs</h2>{body}</section>'
+
+
+def _render_execution(payload):
+    execution = {
+        key: payload[key]
+        for key in ("complexity", "parallel", "delegated")
+        if payload.get(key) is not None
+    }
+    if not execution:
+        body = "<p class=\"empty\">No execution metadata was recorded.</p>"
+    else:
+        cards = [
+            "<div class=\"card\"><h3>{}</h3>{}</div>".format(
+                _escaped(label),
+                _definition_list(value.items())
+                if isinstance(value, dict)
+                else f"<pre>{_escaped(_json_text(value))}</pre>",
+            )
+            for label, value in execution.items()
+        ]
+        body = "<div class=\"grid\">" + "".join(cards) + "</div>"
+    return f"<section class=\"panel\"><h2>Execution</h2>{body}</section>"
 
 
 def _render_gates(gates):

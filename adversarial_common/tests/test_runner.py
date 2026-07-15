@@ -517,3 +517,16 @@ def test_run_delegated_synthesizes_survivors_with_worker_origins(monkeypatch):
         result["synthesis"]["payload"]["findings"][0]["origin"]
         == "worker"
     )
+
+
+def test_worker_origin_only_marks_items_below_findings_key():
+    payload = [
+        {"id": "metadata", "status": "complete"},
+        {"result": {"findings": [{"id": "actual-finding"}]}},
+    ]
+
+    runner._mark_worker_findings(payload)
+
+    assert "origin" not in payload[0]
+    assert "origin" not in payload[1]
+    assert payload[1]["result"]["findings"][0]["origin"] == "worker"
