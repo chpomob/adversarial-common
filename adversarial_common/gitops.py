@@ -6,6 +6,7 @@ and raise :class:`GitError` on any non-zero git exit. Every public function take
 mutation lands in.
 """
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -87,12 +88,48 @@ def auto_init(workdir):
     Sets repo-local ``user.name`` / ``user.email`` (adversarial-loop /
     loop@adversarial.local) so commits never fail on missing identity, and pins
     the initial branch to ``main`` regardless of the host's ``init.defaultBranch``.
+
+    Safety guard: refuses to auto-initialize when *workdir* contains child
+    directories that are themselves git repositories. This prevents the pipeline
+    from creating a parent repo over sibling repos (e.g. ``~/.hermes/skills/``
+    containing adversarial-common, adversarial-code-loop, etc.), whose git
+    operations (stash, checkout) can delete untracked content in sibling dirs.
     """
+    # Safety guard: detect child git repos
+    if _has_child_repos(workdir):
+        children = _find_child_repos(workdir)
+        raise GitError(
+            f"refusing to auto-initialize git repo in {workdir}: "
+            f"it contains {len(children)} child git repo(s) "
+            f"({', '.join(children[:5])}{'...' if len(children) > 5 else ''}). "
+            f"This would make the pipeline create a parent repo over sibling "
+            f"repos, and git stash/checkout operations may destroy untracked "
+            f"content in sibling directories. "
+            f"Use --workdir on the specific repo instead."
+        )
     _git(workdir, ["init"])
     # Pin HEAD to main before the first commit (works on every git >= 2.0).
     _git(workdir, ["symbolic-ref", "HEAD", "refs/heads/main"])
     ensure_git_identity(workdir)
     _git(workdir, ["commit", "--allow-empty", "-m", "Initial commit"])
+
+
+def _has_child_repos(workdir):
+    """True if any immediate subdirectory of *workdir* contains a ``.git``."""
+    return len(_find_child_repos(workdir)) > 0
+
+
+def _find_child_repos(workdir):
+    """Return sorted list of subdirectory names that contain a ``.git``."""
+    try:
+        entries = sorted(
+            e.name for e in os.scandir(workdir)
+            if e.is_dir() and not e.name.startswith(".")
+            and os.path.isdir(os.path.join(e.path, ".git"))
+        )
+    except OSError:
+        return []
+    return entries
 
 
 def ensure_git_identity(workdir):
