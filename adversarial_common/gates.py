@@ -184,40 +184,53 @@ def _run_verification_gate(
 ) -> dict[str, Any]:
     root = Path(workdir)
     result = _gate_base(name, command)
+    timeout_value = _positive_number("timeout", timeout)
+    log_cap = _non_negative_int("max_log_chars", max_log_chars)
+    if not root.is_dir():
+        return _gate_failure(result, 126, f"workdir is not a directory: {root}", True)
     argv, error = _command_argv(command)
     if error:
         return _gate_failure(result, 127, error, True)
-    if _resolve_executable(argv[0], root) is None:
+    resolved = _resolve_executable(argv[0], root)
+    result["resolved_executable"] = resolved or ""
+    if resolved is None:
         return _gate_failure(result, 127, f"verification command not found: {argv[0]}", True)
-    timeout_value = _positive_number("timeout", timeout)
-    log_cap = _non_negative_int("max_log_chars", max_log_chars)
+
+    # Execute the path that was just resolved. Besides avoiding a second PATH
+    # lookup, this closes the gap between preflight and process creation while
+    # preserving the configured command in the audit record.
+    execution_argv = [resolved, *argv[1:]]
     try:
         proc = subprocess.Popen(
-            argv,
+            execution_argv,
             cwd=root,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
+            shell=False,
             start_new_session=True,
         )
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         return _gate_failure(result, 126, f"could not start gate: {exc}", True)
     try:
         log, _ = proc.communicate(timeout=timeout_value)
     except subprocess.TimeoutExpired:
+        cleanup_error = _kill_process_group(proc)
         try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, OSError):
-            proc.kill()
-        log, _ = proc.communicate()
+            log, _ = proc.communicate()
+        except OSError as exc:
+            log = ""
+            cleanup_error = cleanup_error or f"could not collect gate output: {exc}"
         bounded, truncated = _bounded_log(log, log_cap)
         result.update({
             "ok": False, "exit_code": 124, "infra": True,
             "log": bounded, "truncated": truncated,
             "error": f"gate timed out after {timeout_value}s",
         })
+        if cleanup_error:
+            result["cleanup_error"] = cleanup_error
         return result
     bounded, truncated = _bounded_log(log, log_cap)
     result.update({
@@ -320,16 +333,54 @@ def _resolve_executable(executable: str, workdir: Path) -> str | None:
 
 
 def _gate_base(name: str, command: Any) -> dict[str, Any]:
-    if isinstance(command, (list, tuple)):
+    if isinstance(command, (list, tuple)) and all(
+        isinstance(argument, str) for argument in command
+    ):
         rendered = shlex.join(command)
+    elif isinstance(command, str):
+        rendered = command
+    elif command is None:
+        rendered = ""
     else:
-        rendered = command or ""
-    return {"gate": name, "command": rendered}
+        rendered = repr(command)
+    return {
+        "gate": name,
+        "command": rendered,
+        "ok": False,
+        "exit_code": None,
+        "infra": False,
+        "log": "",
+        "truncated": False,
+    }
 
 
 def _gate_failure(result: dict[str, Any], code: int, error: str, infra: bool) -> dict[str, Any]:
     result.update({"ok": False, "exit_code": code, "infra": infra, "log": "", "error": error})
     return result
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> str | None:
+    """Kill the session created for a timed-out verification gate.
+
+    ``start_new_session=True`` makes the child's PID its process-group ID. We
+    intentionally use that stable ID directly: looking it up through a leader
+    that has already exited can fail while descendants in the group keep
+    running and mutating the worktree.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return None
+    except OSError as group_error:
+        try:
+            proc.kill()
+        except OSError as process_error:
+            return (
+                f"could not kill process group ({group_error}); "
+                f"could not kill gate process ({process_error})"
+            )
+        return f"could not kill process group: {group_error}"
+    return None
 
 
 def _bounded_log(log: str, max_chars: int) -> tuple[str, bool]:

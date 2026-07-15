@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import ast
 import json
+import os
+import signal
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
+import adversarial_common.gates as gates
 from adversarial_common import (
     check_context,
     enforce_input_cap,
     enforce_output_cap,
     estimate_complexity,
+    post_build_gate,
+    post_fix_gate,
+    pre_build_gate,
 )
 from adversarial_common.gates import TRUNCATION_MARKER
 
@@ -131,3 +138,196 @@ def test_gate_module_imports_only_standard_library_modules():
 def test_cap_rejects_invalid_limits(bad_limit):
     with pytest.raises((TypeError, ValueError)):
         enforce_output_cap("text", bad_limit)
+
+
+def test_pre_build_refuses_unresolvable_command_before_provider_call(tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'gate-test'\n")
+    provider_calls: list[str] = []
+
+    result = pre_build_gate(tmp_path, ["definitely-not-a-real-gate-command"])
+    if result["ok"]:
+        provider_calls.append("build")
+
+    assert result["ok"] is False
+    assert result["exit_code"] == 127
+    assert result["infra"] is True
+    assert result["project_markers"] == ["pyproject.toml"]
+    assert result["resolved_executable"] == ""
+    assert provider_calls == []
+
+
+def test_pre_build_requires_a_project_marker(tmp_path):
+    result = pre_build_gate(tmp_path, [sys.executable, "-c", "pass"])
+
+    assert result["ok"] is False
+    assert result["exit_code"] == 2
+    assert result["infra"] is False
+    assert result["project_markers"] == []
+
+
+@pytest.mark.parametrize("gate", [post_build_gate, post_fix_gate])
+def test_post_gate_success_merges_output_and_does_not_invoke_a_shell(tmp_path, gate):
+    literal_argument = "literal; exit 91"
+    result = gate(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; print(sys.argv[1], flush=True); "
+                "print('diagnostic', file=sys.stderr, flush=True)"
+            ),
+            literal_argument,
+        ],
+    )
+
+    assert result["ok"] is True
+    assert result["exit_code"] == 0
+    assert result["infra"] is False
+    assert literal_argument in result["log"]
+    assert "diagnostic" in result["log"]
+    assert result["truncated"] is False
+    _assert_gate_result_shape(result)
+
+
+def test_post_gate_reports_verification_failure_as_non_infrastructure(tmp_path):
+    result = post_fix_gate(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('tests failed'); raise SystemExit(7)",
+        ],
+    )
+
+    assert result["ok"] is False
+    assert result["exit_code"] == 7
+    assert result["infra"] is False
+    assert result["log"] == "tests failed\n"
+    _assert_gate_result_shape(result)
+
+
+def test_post_gate_reports_spawn_failure_with_structured_evidence(tmp_path, monkeypatch):
+    popen_options = {}
+
+    def refuse_spawn(*args, **kwargs):
+        popen_options.update(kwargs)
+        raise OSError("simulated spawn failure")
+
+    monkeypatch.setattr(gates.subprocess, "Popen", refuse_spawn)
+
+    result = post_build_gate(tmp_path, [sys.executable, "-c", "pass"])
+
+    assert result["ok"] is False
+    assert result["exit_code"] == 126
+    assert result["infra"] is True
+    assert "simulated spawn failure" in result["error"]
+    assert popen_options["shell"] is False
+    assert popen_options["start_new_session"] is True
+    _assert_gate_result_shape(result)
+
+
+def test_post_gate_timeout_is_an_infrastructure_failure(tmp_path):
+    result = post_build_gate(
+        tmp_path,
+        [
+            sys.executable,
+            "-c",
+            "import time; print('started', flush=True); time.sleep(30)",
+        ],
+        timeout=0.1,
+    )
+
+    assert result["ok"] is False
+    assert result["exit_code"] == 124
+    assert result["infra"] is True
+    assert result["log"] == "started\n"
+    assert "timed out" in result["error"]
+    _assert_gate_result_shape(result)
+
+
+def test_post_gate_timeout_kills_descendant_process_group(tmp_path):
+    heartbeat = tmp_path / "child-heartbeat"
+    child_code = (
+        "import pathlib, sys, time\n"
+        "path = pathlib.Path(sys.argv[1])\n"
+        "with path.open('a', encoding='utf-8') as stream:\n"
+        "    while True:\n"
+        "        stream.write('x')\n"
+        "        stream.flush()\n"
+        "        time.sleep(0.01)\n"
+    )
+    parent_code = (
+        "import pathlib, subprocess, sys, time\n"
+        f"child_code = {child_code!r}\n"
+        f"heartbeat = {str(heartbeat)!r}\n"
+        "child = subprocess.Popen(\n"
+        "    [sys.executable, '-c', child_code, heartbeat],\n"
+        "    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        "deadline = time.monotonic() + 5\n"
+        "while not pathlib.Path(heartbeat).exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    child_pid = None
+
+    try:
+        result = post_fix_gate(
+            tmp_path,
+            [sys.executable, "-c", parent_code],
+            timeout=0.5,
+        )
+        child_pid = int(result["log"].strip())
+        time.sleep(0.05)
+        size_after_cleanup = heartbeat.stat().st_size
+        time.sleep(0.15)
+
+        assert result["exit_code"] == 124
+        assert heartbeat.stat().st_size == size_after_cleanup
+        assert "cleanup_error" not in result
+    finally:
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+def test_post_gate_log_truncation_is_bounded_and_deterministic(tmp_path):
+    payload = "0123456789" * 10
+    result = post_build_gate(
+        tmp_path,
+        [sys.executable, "-c", f"print({payload!r}, end='')"],
+        max_log_chars=32,
+    )
+
+    marker = "[...truncated...]\n"
+    assert result["truncated"] is True
+    assert result["log"] == marker + payload[-(32 - len(marker)):]
+    assert len(result["log"]) == 32
+
+
+@pytest.mark.parametrize("gate", [pre_build_gate, post_build_gate, post_fix_gate])
+def test_invalid_command_sequence_returns_structured_failure(tmp_path, gate):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'gate-test'\n")
+    result = gate(tmp_path, [sys.executable, 1])  # type: ignore[list-item]
+
+    assert result["exit_code"] == 127
+    assert result["infra"] is True
+    assert "sequence of strings" in result["error"]
+    _assert_gate_result_shape(result)
+
+
+def _assert_gate_result_shape(result):
+    assert {
+        "gate",
+        "command",
+        "ok",
+        "exit_code",
+        "infra",
+        "log",
+        "truncated",
+    } <= result.keys()
+    json.dumps(result)
