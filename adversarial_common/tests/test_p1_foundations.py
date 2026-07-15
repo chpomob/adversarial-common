@@ -79,3 +79,16 @@ def test_epistemic_labels_default_with_warning_and_distribution():
     assert payload["warnings"][0]["code"] == "epistemic_label_defaulted"
     distribution = epistemic_distribution(payload["findings"])
     assert distribution["combined"] == {"low/inference": 1, "high/code": 1}
+
+
+def test_epistemic_distribution_does_not_mutate_raw_findings():
+    findings = [
+        {"id": "A1"},
+        {"id": "A2", "confidence": "high", "basis": "code"},
+    ]
+    original = [dict(finding) for finding in findings]
+
+    distribution = epistemic_distribution(findings)
+
+    assert findings == original
+    assert distribution["combined"] == {"low/inference": 1, "high/code": 1}

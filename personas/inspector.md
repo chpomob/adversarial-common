@@ -29,4 +29,4 @@ Output JSON:
 
 ## Epistemic labels
 
-Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited. Preserve `origin=worker` on delegated findings.
+Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited.

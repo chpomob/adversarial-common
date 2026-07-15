@@ -133,18 +133,20 @@ def normalize_findings(payload, warnings: list | None = None):
 
 
 def epistemic_distribution(findings) -> dict:
-    """Count confidence, basis, and combined labels for synthesis/final JSON."""
+    """Count normalized epistemic labels without mutating caller-owned findings."""
     distribution = {
         "confidence": {name: 0 for name in sorted(VALID_CONFIDENCE)},
         "basis": {name: 0 for name in sorted(VALID_BASIS)},
         "combined": {},
     }
-    normalized = normalize_findings(list(findings))
-    for finding in normalized:
+    for finding in findings:
         if not isinstance(finding, dict):
             continue
-        confidence = finding["confidence"]
-        basis = finding["basis"]
+        confidence = finding.get("confidence")
+        basis = finding.get("basis")
+        if confidence not in VALID_CONFIDENCE or basis not in VALID_BASIS:
+            confidence = "low"
+            basis = "inference"
         distribution["confidence"][confidence] += 1
         distribution["basis"][basis] += 1
         key = f"{confidence}/{basis}"

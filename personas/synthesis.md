@@ -17,4 +17,4 @@ The output must be a markdown document with sections:
 
 ## Epistemic weighting
 
-Report the distribution of confidence and basis labels. Treat inference-only findings as lower weight than code-, spec-, or external-backed findings, while retaining them in the report. Preserve `origin=worker` when present.
+Report the distribution of confidence and basis labels. Treat inference-only findings as lower weight than code-, spec-, or external-backed findings, while retaining them in the report.

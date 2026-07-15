@@ -6,6 +6,81 @@ import re
 import shlex
 import sys
 from pathlib import Path
+from typing import Final
+
+
+_NETWORK_TRANSIENT_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"connection (?:was )?(?:reset|closed|aborted|refused)",
+        r"connectionreseterror",
+        r"econn(?:reset|refused|aborted)",
+        r"network (?:is )?(?:unreachable|error|failure)",
+        r"temporary failure in name resolution",
+        r"name or service not known",
+        r"tls (?:error|handshake|alert)",
+        r"ssl(?:error| handshake)",
+        r"unexpected eof",
+        r"eof (?:occurred|error|while)",
+        r"broken pipe",
+        r"timed? out while (?:connecting|reading|waiting)",
+    )
+)
+_PERMANENT_ERROR_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"invalid (?:api[ -]?key|authentication|credentials)",
+        r"authentication (?:failed|required)",
+        r"\bunauthorized\b",
+        r"\bforbidden\b",
+        r"permission denied",
+        r"malformed (?:request|input|json)",
+    )
+)
+_HTTP_STATUS_RE: Final = re.compile(
+    r"(?:\bhttp(?:/\d(?:\.\d)?)?\s*|\bstatus(?:\s+code)?\s*[:=]?\s*)(4\d{2})\b",
+    re.IGNORECASE,
+)
+_RETRYABLE_HTTP_STATUSES: Final = frozenset({408, 409, 425, 429})
+_PROVIDER_TRANSIENT_PATTERNS: Final[dict[str, tuple[re.Pattern[str], ...]]] = {
+    "claude": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\boverloaded_error\b",
+            r"\bservice overloaded\b",
+            r"\brate[_ -]?limit(?:ed| exceeded)?\b",
+            r"\bapi_error\b",
+        )
+    ),
+    "claude-tmux": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"\boverloaded_error\b",
+            r"\bservice overloaded\b",
+            r"\brate[_ -]?limit(?:ed| exceeded)?\b",
+            r"\bapi_error\b",
+        )
+    ),
+    "codex": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"stream disconnected",
+            r"error sending request",
+            r"failed to decode response body",
+            r"\brate[_ -]?limit(?:ed| exceeded)?\b",
+            r"\bserver (?:is )?overloaded\b",
+        )
+    ),
+    "pi": tuple(
+        re.compile(pattern, re.IGNORECASE)
+        for pattern in (
+            r"fetch failed",
+            r"socket hang up",
+            r"\brate[_ -]?limit(?:ed| exceeded)?\b",
+            r"\bservice unavailable\b",
+        )
+    ),
+}
 
 
 def detect_provider(cmd):
@@ -28,6 +103,83 @@ def detect_provider(cmd):
     if executable in {"codex", "claude", "pi"}:
         return executable
     return "other"
+
+
+def classify_transient_error(
+    cmd,
+    returncode,
+    stderr="",
+    *,
+    elapsed=None,
+    timeout=None,
+):
+    """Return a stable retry reason for a transient provider failure.
+
+    A status of 124 is retryable only when the provider returned substantially
+    before our own timeout. This distinguishes provider-side "fast hangs"
+    from a process that consumed the full execution allowance. HTTP 408, 409,
+    425, and 429 retain their standard transient meaning; other 4xx responses
+    are treated as permanent client failures.
+    """
+    text = stderr if isinstance(stderr, str) else str(stderr or "")
+    if returncode == 0:
+        return None
+    if returncode in {126, 127}:
+        return None
+    if any(pattern.search(text) for pattern in _PERMANENT_ERROR_PATTERNS):
+        return None
+
+    statuses = {int(match) for match in _HTTP_STATUS_RE.findall(text)}
+    if statuses:
+        hard_statuses = statuses.difference(_RETRYABLE_HTTP_STATUSES)
+        if hard_statuses:
+            return None
+        return f"http_{min(statuses)}"
+
+    if returncode == 124:
+        if _is_fast_timeout(elapsed, timeout):
+            return "fast_124"
+        return None
+    if any(pattern.search(text) for pattern in _NETWORK_TRANSIENT_PATTERNS):
+        return "network"
+
+    provider = (
+        cmd if isinstance(cmd, str) and cmd in _PROVIDER_TRANSIENT_PATTERNS
+        else detect_provider(cmd)
+    )
+    for pattern in _PROVIDER_TRANSIENT_PATTERNS.get(provider, ()):
+        if pattern.search(text):
+            return f"{provider}_transient"
+    if returncode == 75:
+        return "temporary_failure"
+    if returncode in _RETRYABLE_HTTP_STATUSES:
+        return f"exit_{returncode}"
+    return None
+
+
+def is_transient_error(
+    cmd,
+    returncode,
+    stderr="",
+    *,
+    elapsed=None,
+    timeout=None,
+):
+    """Return whether a failed provider invocation is safe to retry."""
+    return classify_transient_error(
+        cmd, returncode, stderr, elapsed=elapsed, timeout=timeout
+    ) is not None
+
+
+def _is_fast_timeout(elapsed, timeout):
+    if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
+        return False
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        return False
+    if elapsed < 0 or timeout <= 0:
+        return False
+    # Leave a generous 10% margin for process teardown and clock granularity.
+    return elapsed < timeout * 0.9
 
 
 def persona_for_role(role_name, cmd):
@@ -156,7 +308,7 @@ def run_cmd(
 
 
 __all__ = [
-    "default_wrapper_cmd", "detect_provider", "enhance_cmd_for_project",
-    "extract_usage_metadata", "inject_persona", "persona_for_role",
-    "resolve_role_cmd", "run_cmd",
+    "classify_transient_error", "default_wrapper_cmd", "detect_provider",
+    "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",
+    "is_transient_error", "persona_for_role", "resolve_role_cmd", "run_cmd",
 ]

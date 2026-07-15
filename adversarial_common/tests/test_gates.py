@@ -246,6 +246,41 @@ def test_post_gate_timeout_is_an_infrastructure_failure(tmp_path):
     _assert_gate_result_shape(result)
 
 
+def test_post_gate_timeout_bounds_output_drain_when_cleanup_fails(
+    tmp_path, monkeypatch
+):
+    class UnkillableProcess:
+        pid = 12345
+        stdout = None
+        returncode = None
+
+        def __init__(self):
+            self.timeouts = []
+
+        def communicate(self, timeout=None):
+            self.timeouts.append(timeout)
+            raise subprocess.TimeoutExpired(
+                "gate", timeout, output=b"partial output\n"
+            )
+
+    proc = UnkillableProcess()
+    monkeypatch.setattr(gates.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(
+        gates,
+        "_kill_process_group",
+        lambda _proc: "could not kill gate process",
+    )
+
+    result = post_build_gate(
+        tmp_path, [sys.executable, "-c", "pass"], timeout=0.1
+    )
+
+    assert result["exit_code"] == 124
+    assert result["log"] == "partial output\n"
+    assert result["cleanup_error"] == "could not kill gate process"
+    assert proc.timeouts == [0.1, gates._POST_KILL_DRAIN_TIMEOUT]
+
+
 def test_post_gate_timeout_kills_descendant_process_group(tmp_path):
     heartbeat = tmp_path / "child-heartbeat"
     child_code = (

@@ -25,4 +25,4 @@ Style: objective, decisive, concise, precise.
 
 ## Epistemic weighting
 
-Evaluate every finding using its `confidence` and `basis`. Down-weight inference-only findings and do not treat them as dispositive without corroborating code, spec, or external evidence. Preserve labels and `origin=worker` in the decision.
+Evaluate every finding using its `confidence` and `basis`. Down-weight inference-only findings and do not treat them as dispositive without corroborating code, spec, or external evidence. Preserve the labels in the decision.

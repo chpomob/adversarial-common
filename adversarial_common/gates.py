@@ -34,6 +34,7 @@ _PROJECT_MARKERS: Final = (
     ".git", "pyproject.toml", "setup.py", "package.json", "Cargo.toml",
     "go.mod", "Makefile", "CMakeLists.txt", "build.gradle", "build.gradle.kts",
 )
+_POST_KILL_DRAIN_TIMEOUT: Final = 1.0
 
 
 def check_context(
@@ -219,7 +220,18 @@ def _run_verification_gate(
     except subprocess.TimeoutExpired:
         cleanup_error = _kill_process_group(proc)
         try:
-            log, _ = proc.communicate()
+            log, _ = proc.communicate(timeout=_POST_KILL_DRAIN_TIMEOUT)
+        except subprocess.TimeoutExpired as exc:
+            partial_output = exc.output or ""
+            log = (
+                partial_output.decode("utf-8", errors="replace")
+                if isinstance(partial_output, bytes) else partial_output
+            )
+            cleanup_error = cleanup_error or (
+                "gate process remained alive after cleanup; output drain timed out"
+            )
+            if proc.stdout is not None:
+                proc.stdout.close()
         except OSError as exc:
             log = ""
             cleanup_error = cleanup_error or f"could not collect gate output: {exc}"
