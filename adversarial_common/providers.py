@@ -143,10 +143,7 @@ def classify_transient_error(
     if any(pattern.search(text) for pattern in _NETWORK_TRANSIENT_PATTERNS):
         return "network"
 
-    provider = (
-        cmd if isinstance(cmd, str) and cmd in _PROVIDER_TRANSIENT_PATTERNS
-        else detect_provider(cmd)
-    )
+    provider = detect_provider(cmd)
     for pattern in _PROVIDER_TRANSIENT_PATTERNS.get(provider, ()):
         if pattern.search(text):
             return f"{provider}_transient"

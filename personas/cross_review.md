@@ -30,4 +30,18 @@ Output JSON:
 
 ## Epistemic labels
 
-Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited.
+Every finding must include `confidence` (`high`, `medium`, or `low`) and
+`basis` (`spec`, `code`, `inference`, or `external`). Choose both labels from
+the evidence actually cited, not from the finding's severity or the original
+reviewer's labels.
+
+Evidence must match `basis`:
+- `spec`: quote or identify the exact requirement or acceptance criterion.
+- `code`: cite the concrete file/line and the behavior visible in the code or diff.
+- `inference`: state the reasoning and assumptions, plus what would confirm or refute them.
+- `external`: name and cite the authoritative external source, including version or date when relevant.
+
+Use `high` only for direct, unambiguous support, `medium` when support depends
+on context, and `low` for tentative claims that still need verification. Label
+your own validation or challenge from its evidence; do not copy a label merely
+because the original finding used it.

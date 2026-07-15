@@ -83,4 +83,17 @@ Your job:
 
 ## Epistemic labels
 
-Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited.
+Every finding must include `confidence` (`high`, `medium`, or `low`) and
+`basis` (`spec`, `code`, `inference`, or `external`). Choose both labels from
+the evidence actually cited, not from the finding's severity.
+
+Evidence must match `basis`:
+- `spec`: quote or identify the exact requirement, criterion, section, or contradiction.
+- `code`: cite concrete repository behavior only when the spec makes a code-verifiable claim.
+- `inference`: state the reasoning and assumptions, plus what would confirm or refute them.
+- `external`: name and cite the authoritative external source, including version or date when relevant.
+
+Use `high` only for direct, unambiguous support, `medium` when support depends
+on context, and `low` for tentative claims that still need verification. Most
+document-internal findings should use `basis: spec`; do not label an inferred
+missing requirement as code-backed merely because a target file is named.

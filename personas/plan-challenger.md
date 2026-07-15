@@ -85,4 +85,17 @@ Your job:
 
 ## Epistemic labels
 
-Every finding must include `confidence` (`high`, `medium`, or `low`) and `basis` (`spec`, `code`, `inference`, or `external`). Choose the label from the evidence actually cited.
+Every finding must include `confidence` (`high`, `medium`, or `low`) and
+`basis` (`spec`, `code`, `inference`, or `external`). Choose both labels from
+the evidence actually cited, not from the finding's severity.
+
+Evidence must match `basis`:
+- `spec`: quote or identify the exact requirement or acceptance criterion.
+- `code`: cite the concrete plan text, dependency, file assignment, or test contract being assessed.
+- `inference`: state the reasoning and assumptions, plus what would confirm or refute them.
+- `external`: name and cite the authoritative external source, including version or date when relevant.
+
+Use `high` only for direct, unambiguous support, `medium` when support depends
+on context, and `low` for tentative claims that still need verification. For
+plan-versus-spec mismatches use `basis: spec`; use `basis: code` for defects
+demonstrated by the plan document itself.
