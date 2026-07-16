@@ -1,12 +1,493 @@
-"""Provider detection, persona injection, role resolution, and usage parsing."""
+"""Provider registry loading and provider runtime helpers."""
 
+import importlib
 import json
+import math
 import os
 import re
 import shlex
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final
+from types import MappingProxyType
+from typing import Final, Mapping
+
+
+DEFAULT_PROVIDER_CONFIG_PATH: Final = Path("~/.config/adversarial/providers.yaml")
+PROVIDER_CONFIG_ENV: Final = "ADVERSARIAL_PROVIDER_CONFIG"
+_ROLE_OVERRIDE_PREFIX: Final = "ADVERSARIAL_"
+_ROLE_OVERRIDE_SUFFIX: Final = "_PROVIDERS"
+_ROLE_NAME_RE: Final = re.compile(r"^[a-z][a-z0-9_]*$")
+_KNOWN_PROVIDER_ROLES: Final = frozenset(
+    {
+        "architect",
+        "arbiter",
+        "builder",
+        "critic",
+        "cross_review",
+        "dev",
+        "fixer",
+        "inspector",
+        "judge",
+        "plan_challenger",
+        "plan_writer",
+        "research",
+        "review",
+        "spec_challenger",
+        "spec_writer",
+        "synthesis",
+        "verifier",
+        "verify",
+    }
+)
+_CONFIG_KEYS: Final = frozenset({"quota_cmd", "quota_cache_ttl", "roles"})
+_ENTRY_KEYS: Final = frozenset(
+    {"alias", "cmd", "command", "quota_check", "stop_threshold"}
+)
+
+
+class ProviderConfigError(ValueError):
+    """A provider configuration error with a stable machine-readable code."""
+
+    def __init__(self, code: str, detail: str):
+        self.code = code
+        self.detail = detail
+        super().__init__(f"{code}: {detail}")
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderEntry:
+    """One immutable provider candidate in a role's preference chain."""
+
+    alias: str
+    command: str
+    quota_check: str | None = None
+    stop_threshold: int | float | None = None
+
+    def __post_init__(self) -> None:
+        alias = _required_text(self.alias, "PROVIDER_CONFIG_INVALID_ALIAS", "alias")
+        command = _required_text(
+            self.command, "PROVIDER_CONFIG_INVALID_COMMAND", "command"
+        )
+        quota_check = self.quota_check
+        if quota_check is not None:
+            quota_check = _required_text(
+                quota_check,
+                "PROVIDER_CONFIG_INVALID_QUOTA_CHECK",
+                "quota_check",
+            )
+        threshold = self.stop_threshold
+        if threshold is not None:
+            threshold = _number(
+                threshold,
+                "PROVIDER_CONFIG_INVALID_THRESHOLD",
+                "stop_threshold",
+            )
+            if not 0 <= threshold <= 100:
+                raise ProviderConfigError(
+                    "PROVIDER_CONFIG_INVALID_THRESHOLD",
+                    "stop_threshold must be between 0 and 100",
+                )
+        object.__setattr__(self, "alias", alias)
+        object.__setattr__(self, "command", command)
+        object.__setattr__(self, "quota_check", quota_check)
+        object.__setattr__(self, "stop_threshold", threshold)
+
+    @property
+    def cmd(self) -> str:
+        """Return the YAML-compatible name for :attr:`command`."""
+        return self.command
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a YAML/JSON-safe representation of this entry."""
+        result: dict[str, object] = {"alias": self.alias, "cmd": self.command}
+        if self.quota_check is not None:
+            result["quota_check"] = self.quota_check
+        if self.stop_threshold is not None:
+            result["stop_threshold"] = self.stop_threshold
+        return result
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderConfig:
+    """An immutable registry of ordered provider chains keyed by role."""
+
+    roles: Mapping[str, tuple[ProviderEntry, ...]] = field(default_factory=dict)
+    quota_cmd: str | None = None
+    quota_cache_ttl: int | float = 30
+    source_path: Path | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.roles, Mapping):
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_ROLES", "roles must be a mapping"
+            )
+        immutable_roles: dict[str, tuple[ProviderEntry, ...]] = {}
+        for role, entries in self.roles.items():
+            normalized_role = _role_name(role)
+            if isinstance(entries, (str, bytes)):
+                raise ProviderConfigError(
+                    "PROVIDER_CONFIG_INVALID_CHAIN",
+                    f"role '{normalized_role}' must contain an array",
+                )
+            try:
+                chain = tuple(entries)
+            except TypeError as exc:
+                raise ProviderConfigError(
+                    "PROVIDER_CONFIG_INVALID_CHAIN",
+                    f"role '{normalized_role}' must contain an array",
+                ) from exc
+            if not chain:
+                raise ProviderConfigError(
+                    "PROVIDER_CONFIG_EMPTY_CHAIN",
+                    f"role '{normalized_role}' must contain at least one provider",
+                )
+            if not all(isinstance(entry, ProviderEntry) for entry in chain):
+                raise ProviderConfigError(
+                    "PROVIDER_CONFIG_INVALID_ENTRY",
+                    f"role '{normalized_role}' contains a non-ProviderEntry value",
+                )
+            aliases: set[str] = set()
+            for entry in chain:
+                if entry.alias in aliases:
+                    raise ProviderConfigError(
+                        "PROVIDER_CONFIG_DUPLICATE_ALIAS",
+                        f"role '{normalized_role}' contains duplicate alias "
+                        f"'{entry.alias}'",
+                    )
+                aliases.add(entry.alias)
+            immutable_roles[normalized_role] = chain
+
+        quota_cmd = self.quota_cmd
+        if quota_cmd is not None:
+            quota_cmd = _required_text(
+                quota_cmd, "PROVIDER_CONFIG_INVALID_QUOTA_CMD", "quota_cmd"
+            )
+        ttl = _number(
+            self.quota_cache_ttl,
+            "PROVIDER_CONFIG_INVALID_TTL",
+            "quota_cache_ttl",
+        )
+        if ttl < 0:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_TTL", "quota_cache_ttl must be >= 0"
+            )
+        source_path = self.source_path
+        if source_path is not None:
+            source_path = Path(source_path).expanduser().resolve(strict=False)
+
+        object.__setattr__(self, "roles", MappingProxyType(immutable_roles))
+        object.__setattr__(self, "quota_cmd", quota_cmd)
+        object.__setattr__(self, "quota_cache_ttl", ttl)
+        object.__setattr__(self, "source_path", source_path)
+
+    def chain_for(self, role: str) -> tuple[ProviderEntry, ...]:
+        """Return a role's ordered chain, raising ``KeyError`` if absent."""
+        return self.roles[_role_name(role)]
+
+    def __getitem__(self, role: str) -> tuple[ProviderEntry, ...]:
+        return self.roles[_role_name(role)]
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the external YAML representation of the registry."""
+        result: dict[str, object] = {
+            role: [entry.to_dict() for entry in entries]
+            for role, entries in self.roles.items()
+        }
+        if self.quota_cmd is not None:
+            result["quota_cmd"] = self.quota_cmd
+        result["quota_cache_ttl"] = self.quota_cache_ttl
+        return result
+
+    @classmethod
+    def load(
+        cls,
+        path: str | os.PathLike[str] | None = None,
+        *,
+        environ: Mapping[str, str] | None = None,
+    ) -> "ProviderConfig | None":
+        """Load a registry using CLI-path, environment, then default precedence."""
+        return load_provider_config(path, environ=environ)
+
+
+# Registry is a useful semantic name for callers that do not own configuration.
+ProviderRegistry = ProviderConfig
+
+
+def resolve_provider_config_path(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> tuple[Path, bool]:
+    """Return ``(resolved_path, explicitly_selected)`` for the registry."""
+    environment = os.environ if environ is None else environ
+    if path is not None:
+        try:
+            raw_path = os.fspath(path)
+        except TypeError as exc:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_PATH",
+                "provider config path must be a path string",
+            ) from exc
+        explicit = True
+    elif PROVIDER_CONFIG_ENV in environment:
+        raw_path = environment[PROVIDER_CONFIG_ENV]
+        explicit = True
+    else:
+        raw_path = os.fspath(DEFAULT_PROVIDER_CONFIG_PATH)
+        explicit = False
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ProviderConfigError(
+            "PROVIDER_CONFIG_INVALID_PATH", "provider config path must be non-empty"
+        )
+    return _expand_config_path(raw_path, environment), explicit
+
+
+def load_provider_config(
+    path: str | os.PathLike[str] | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> ProviderConfig | None:
+    """Load, validate, and apply role overrides to one selected YAML file.
+
+    ``path`` represents the CLI selection and therefore has highest precedence.
+    A missing implicit default enables legacy mode and returns ``None``.  A path
+    selected by the argument or environment is explicit and must exist.
+    """
+    environment = os.environ if environ is None else environ
+    selected_path, explicit = resolve_provider_config_path(path, environ=environment)
+    if not selected_path.is_file():
+        if explicit:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_NOT_FOUND",
+                f"provider config file not found: {selected_path}",
+            )
+        raw_config: dict[str, object] = {}
+        source_path: Path | None = None
+    else:
+        source_path = selected_path
+        try:
+            yaml = importlib.import_module("yaml")
+        except ImportError as exc:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_YAML_UNAVAILABLE",
+                "YAML support is unavailable; install PyYAML",
+            ) from exc
+        try:
+            with selected_path.open("r", encoding="utf-8") as stream:
+                loaded = yaml.safe_load(stream)
+        except yaml.YAMLError as exc:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_YAML", "provider config is malformed YAML"
+            ) from exc
+        except (OSError, UnicodeError) as exc:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_READ_ERROR",
+                f"provider config could not be read: {selected_path}",
+            ) from exc
+        if loaded is None:
+            raw_config = {}
+        elif not isinstance(loaded, dict):
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_ROOT",
+                "provider config root must be a mapping",
+            )
+        else:
+            raw_config = loaded
+
+    roles, quota_cmd, ttl = _parse_config_mapping(raw_config)
+    overrides = _load_role_overrides(environment, known_roles=roles)
+    roles.update(overrides)
+    if source_path is None and not roles and quota_cmd is None and ttl == 30:
+        return None
+    return ProviderConfig(
+        roles=roles,
+        quota_cmd=quota_cmd,
+        quota_cache_ttl=ttl,
+        source_path=source_path,
+    )
+
+
+def _parse_config_mapping(
+    value: Mapping[object, object],
+) -> tuple[dict[str, tuple[ProviderEntry, ...]], str | None, int | float]:
+    nested_roles = value.get("roles")
+    if "roles" in value and not isinstance(nested_roles, dict):
+        raise ProviderConfigError(
+            "PROVIDER_CONFIG_INVALID_ROLES", "roles must be a mapping"
+        )
+    role_values: dict[object, object] = dict(nested_roles or {})
+    for key, chain in value.items():
+        if key in _CONFIG_KEYS:
+            continue
+        if not isinstance(key, str):
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_ROLE", "role names must be strings"
+            )
+        if key in role_values:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_DUPLICATE_ROLE",
+                f"role '{key}' is configured more than once",
+            )
+        role_values[key] = chain
+    roles = {
+        _role_name(role): _parse_chain(chain, str(role))
+        for role, chain in role_values.items()
+    }
+    raw_quota_cmd = value.get("quota_cmd")
+    quota_cmd = None
+    if raw_quota_cmd is not None:
+        quota_cmd = _required_text(
+            raw_quota_cmd, "PROVIDER_CONFIG_INVALID_QUOTA_CMD", "quota_cmd"
+        )
+    ttl = _number(
+        value.get("quota_cache_ttl", 30),
+        "PROVIDER_CONFIG_INVALID_TTL",
+        "quota_cache_ttl",
+    )
+    if ttl < 0:
+        raise ProviderConfigError(
+            "PROVIDER_CONFIG_INVALID_TTL", "quota_cache_ttl must be >= 0"
+        )
+    return roles, quota_cmd, ttl
+
+
+def _load_role_overrides(
+    environment: Mapping[str, str],
+    *,
+    known_roles: Mapping[str, object],
+) -> dict[str, tuple[ProviderEntry, ...]]:
+    overrides: dict[str, tuple[ProviderEntry, ...]] = {}
+    for variable, encoded in environment.items():
+        if not (
+            variable.startswith(_ROLE_OVERRIDE_PREFIX)
+            and variable.endswith(_ROLE_OVERRIDE_SUFFIX)
+        ):
+            continue
+        role_part = variable[
+            len(_ROLE_OVERRIDE_PREFIX) : -len(_ROLE_OVERRIDE_SUFFIX)
+        ]
+        if not role_part:
+            continue
+        candidate = role_part.lower()
+        if not _ROLE_NAME_RE.fullmatch(candidate):
+            continue
+        role = candidate
+        if role not in known_roles and role not in _KNOWN_PROVIDER_ROLES:
+            continue
+        try:
+            value = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_OVERRIDE_JSON",
+                f"{variable} must contain a JSON array",
+            ) from exc
+        overrides[role] = _parse_chain(value, role, source=variable)
+    return overrides
+
+
+def _parse_chain(
+    value: object, role: str, *, source: str | None = None
+) -> tuple[ProviderEntry, ...]:
+    location = source or f"role '{role}'"
+    if not isinstance(value, list):
+        raise ProviderConfigError(
+            "PROVIDER_CONFIG_INVALID_CHAIN", f"{location} must contain an array"
+        )
+    if not value:
+        raise ProviderConfigError(
+            "PROVIDER_CONFIG_EMPTY_CHAIN",
+            f"{location} must contain at least one provider",
+        )
+    entries: list[ProviderEntry] = []
+    aliases: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_INVALID_ENTRY",
+                f"{location} entry {index} must be a mapping",
+            )
+        unknown = set(item).difference(_ENTRY_KEYS)
+        if unknown:
+            key = sorted(str(name) for name in unknown)[0]
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_UNKNOWN_ENTRY_KEY",
+                f"{location} entry {index} has unknown key '{key}'",
+            )
+        if "alias" not in item:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_MISSING_ALIAS",
+                f"{location} entry {index} is missing alias",
+            )
+        has_cmd = "cmd" in item
+        has_command = "command" in item
+        if has_cmd and has_command:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_DUPLICATE_COMMAND",
+                f"{location} entry {index} must use only one of cmd or command",
+            )
+        if not has_cmd and not has_command:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_MISSING_COMMAND",
+                f"{location} entry {index} is missing cmd",
+            )
+        entry = ProviderEntry(
+            alias=item["alias"],
+            command=item["cmd"] if has_cmd else item["command"],
+            quota_check=item.get("quota_check"),
+            stop_threshold=item.get("stop_threshold"),
+        )
+        if entry.alias in aliases:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_DUPLICATE_ALIAS",
+                f"{location} contains duplicate alias '{entry.alias}'",
+            )
+        aliases.add(entry.alias)
+        entries.append(entry)
+    return tuple(entries)
+
+
+def _role_name(value: object) -> str:
+    if not isinstance(value, str) or not _ROLE_NAME_RE.fullmatch(value):
+        raise ProviderConfigError(
+            "PROVIDER_CONFIG_INVALID_ROLE",
+            "role names must match ^[a-z][a-z0-9_]*$",
+        )
+    return value
+
+
+def _expand_config_path(raw_path: str, environment: Mapping[str, str]) -> Path:
+    """Expand the selected path while honoring an injected HOME in tests/CI."""
+    if raw_path == "~" or raw_path.startswith("~/"):
+        home = environment.get("HOME")
+        if not home:
+            raise ProviderConfigError(
+                "PROVIDER_CONFIG_HOME_UNSET",
+                "HOME must be set to expand the provider config path",
+            )
+        raw_path = os.path.join(home, raw_path[2:]) if raw_path != "~" else home
+    elif raw_path.startswith("~"):
+        raise ProviderConfigError(
+            "PROVIDER_CONFIG_INVALID_PATH",
+            "provider config path supports only '~' or '~/' expansion",
+        )
+    return Path(raw_path).resolve(strict=False)
+
+
+def _required_text(value: object, code: str, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ProviderConfigError(code, f"{field_name} must be a non-empty string")
+    return value.strip()
+
+
+def _number(value: object, code: str, field_name: str) -> int | float:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        raise ProviderConfigError(code, f"{field_name} must be a finite number")
+    return value
 
 
 _NETWORK_TRANSIENT_PATTERNS: Final[tuple[re.Pattern[str], ...]] = tuple(
@@ -207,9 +688,34 @@ def enhance_cmd_for_project(cmd, project_path):
     return cmd
 
 
-def resolve_role_cmd(role, flag_value, env_var, default=None):
-    """Resolve a role command using flag, environment, then default."""
-    cmd = (flag_value or os.environ.get(env_var) or default or "").strip()
+def resolve_role_cmd(
+    role,
+    flag_value,
+    env_var,
+    default=None,
+    *,
+    provider_config=None,
+    config_path=None,
+    environ=None,
+):
+    """Resolve a role command using flag, environment, registry, then default.
+
+    When neither the CLI flag nor its legacy environment variable is set, the
+    configured role chain's first (most-preferred) provider is selected.  A
+    supplied ``provider_config`` avoids reloading the registry when callers
+    resolve several roles together.
+    """
+    environment = os.environ if environ is None else environ
+    cmd = flag_value or environment.get(env_var)
+    if not cmd:
+        registry = provider_config
+        if registry is None:
+            registry = load_provider_config(config_path, environ=environment)
+        if registry is not None:
+            chain = registry.roles.get(role, ())
+            if chain:
+                cmd = chain[0].command
+    cmd = (cmd or default or "").strip()
     if not cmd:
         print(
             f"X No command configured for role '{role}' "
@@ -401,7 +907,10 @@ def run_cmd(
 
 
 __all__ = [
+    "DEFAULT_PROVIDER_CONFIG_PATH", "PROVIDER_CONFIG_ENV", "ProviderConfig",
+    "ProviderConfigError", "ProviderEntry", "ProviderRegistry",
     "classify_transient_error", "default_wrapper_cmd", "detect_provider",
     "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",
-    "is_transient_error", "persona_for_role", "resolve_role_cmd", "run_cmd",
+    "is_transient_error", "load_provider_config", "persona_for_role",
+    "resolve_provider_config_path", "resolve_role_cmd", "run_cmd",
 ]

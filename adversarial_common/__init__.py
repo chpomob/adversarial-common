@@ -34,6 +34,12 @@ from .jsonio import (
     write_final_json,
 )
 from .providers import (
+    DEFAULT_PROVIDER_CONFIG_PATH,
+    PROVIDER_CONFIG_ENV,
+    ProviderConfig,
+    ProviderConfigError,
+    ProviderEntry,
+    ProviderRegistry,
     classify_transient_error,
     default_wrapper_cmd,
     detect_provider,
@@ -41,7 +47,9 @@ from .providers import (
     extract_usage_metadata,
     inject_persona,
     is_transient_error,
+    load_provider_config,
     persona_for_role,
+    resolve_provider_config_path,
     resolve_role_cmd,
     run_cmd,
 )
@@ -106,9 +114,12 @@ __all__ = [
     "parse_json_output", "resume_artifact", "save_artifact",
     "strip_json_wrapper", "write_final_json",
     # providers
+    "DEFAULT_PROVIDER_CONFIG_PATH", "PROVIDER_CONFIG_ENV", "ProviderConfig",
+    "ProviderConfigError", "ProviderEntry", "ProviderRegistry",
     "classify_transient_error", "default_wrapper_cmd", "detect_provider",
     "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",
-    "is_transient_error", "persona_for_role", "resolve_role_cmd", "run_cmd",
+    "is_transient_error", "load_provider_config", "persona_for_role",
+    "resolve_provider_config_path", "resolve_role_cmd", "run_cmd",
     # report
     "render_html_report", "render_report",
     # runner
