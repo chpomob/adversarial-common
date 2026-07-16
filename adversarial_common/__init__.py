@@ -53,6 +53,17 @@ from .providers import (
     resolve_role_cmd,
     run_cmd,
 )
+from .quota import (
+    DRAINING,
+    KEY_INVALID,
+    OK,
+    PROVIDER_STATES,
+    RATE_LIMITED,
+    UNKNOWN,
+    NoProviderAvailable,
+    ProviderDecision,
+    QuotaResolver,
+)
 from .report import render_html_report, render_report
 from .runner import (
     CI_EXIT_BLOCKING,
@@ -120,6 +131,10 @@ __all__ = [
     "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",
     "is_transient_error", "load_provider_config", "persona_for_role",
     "resolve_provider_config_path", "resolve_role_cmd", "run_cmd",
+    # quota
+    "DRAINING", "KEY_INVALID", "NoProviderAvailable", "OK",
+    "PROVIDER_STATES", "ProviderDecision", "QuotaResolver", "RATE_LIMITED",
+    "UNKNOWN",
     # report
     "render_html_report", "render_report",
     # runner
