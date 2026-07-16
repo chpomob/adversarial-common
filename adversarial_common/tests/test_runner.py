@@ -8,6 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 from adversarial_common import gates, runner
 from adversarial_common.costs import CostLedger
+from adversarial_common.quota import (
+    NoProviderAvailable,
+    OK,
+    ProviderDecision,
+)
 
 
 class FakeClock:
@@ -21,6 +26,260 @@ class FakeClock:
 def _attempts(monkeypatch, results):
     pending = deque(results)
     monkeypatch.setattr(runner, "_execute_attempt", lambda *args: pending.popleft())
+
+
+def _decision(command="echo build", **overrides):
+    values = {
+        "alias": "codex",
+        "command": command,
+        "quota_state": OK,
+        "fallback": False,
+        "reason": "selected first eligible provider",
+        "raw_snapshot": {},
+        "forced": False,
+        "error": None,
+    }
+    values.update(overrides)
+    return ProviderDecision(**values)
+
+
+def test_run_phase_cmd_resolves_command_and_records_decision(monkeypatch):
+    calls = []
+
+    class Resolver:
+        def resolve(self, role, **kwargs):
+            calls.append((role, kwargs))
+            return _decision()
+
+    def fake_run_cli(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return runner.RunResult(("done", "", 0), {"existing": True})
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+
+    result = runner.run_phase_cmd(
+        "build",
+        "dev",
+        "/tmp/project",
+        Resolver(),
+        persona_file="/tmp/test_persona.md",
+    )
+
+    assert calls[0] == (
+        "dev",
+        {
+            "workdir": "/tmp/project",
+            "force": False,
+            "force_provider": None,
+        },
+    )
+    assert calls[1] == (
+        "echo build",
+        {
+            "cwd": "/tmp/project",
+            "phase": "build",
+            "persona_file": "/tmp/test_persona.md",
+        },
+    )
+    assert result.metadata == {
+        "existing": True,
+        "provider_decision": {
+            "phase": "build",
+            "alias": "codex",
+            "quota_state": "OK",
+            "fallback": False,
+            "forced": False,
+            "reason": "selected first eligible provider",
+        },
+    }
+
+
+def test_run_phase_cmd_explicit_command_skips_resolution(monkeypatch):
+    class Resolver:
+        def resolve(self, *args, **kwargs):
+            raise AssertionError("explicit commands must bypass the resolver")
+
+    received = []
+
+    def fake_run_cli(cmd, **kwargs):
+        received.append((cmd, kwargs))
+        return runner.RunResult(("manual", "", 0))
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+
+    result = runner.run_phase_cmd(
+        "build", "dev", "/tmp/project", Resolver(), explicit_cmd="echo manual"
+    )
+
+    assert received[0][0] == "echo manual"
+    assert "provider_decision" not in result.metadata
+
+
+def test_run_phase_cmd_without_resolver_preserves_legacy_command(monkeypatch):
+    received = []
+
+    def fake_run_cli(cmd, **kwargs):
+        received.append((cmd, kwargs))
+        return runner.RunResult(("legacy", "", 0))
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+
+    result = runner.run_phase_cmd(
+        "review",
+        "critic",
+        "/tmp/project",
+        None,
+        explicit_cmd="echo legacy",
+    )
+
+    assert received[0][0] == "echo legacy"
+    assert "provider_decision" not in result.metadata
+
+
+def test_run_phase_cmd_without_resolver_accepts_cmd_keyword(monkeypatch):
+    received = []
+
+    def fake_run_cli(cmd, **kwargs):
+        received.append((cmd, kwargs))
+        return runner.RunResult(("legacy", "", 0))
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+
+    runner.run_phase_cmd(
+        "review",
+        "critic",
+        "/tmp/project",
+        None,
+        cmd="echo legacy",
+    )
+
+    assert received[0][0] == "echo legacy"
+
+
+def test_run_phase_cmd_returns_reject_when_no_provider_is_available(monkeypatch):
+    class Resolver:
+        def resolve(self, *args, **kwargs):
+            raise NoProviderAvailable(
+                "dev",
+                {"codex": {"status": 429}},
+                {"codex": "quota state RATE-LIMITED"},
+            )
+
+    monkeypatch.setattr(
+        runner,
+        "run_cli",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("run_cli must not run without an eligible provider")
+        ),
+    )
+
+    result = runner.run_phase_cmd(
+        "build", "dev", "/tmp/project", Resolver()
+    )
+
+    assert result[0] == ""
+    assert result[2] == 4
+    assert result[2] != runner.COST_BUDGET_EXIT_CODE
+    assert result.metadata["error"] == (
+        "No provider available for role 'dev': "
+        "codex: quota state RATE-LIMITED"
+    )
+    assert result.metadata["rejection_reasons"] == {
+        "codex": "quota state RATE-LIMITED"
+    }
+    assert result.metadata["raw_snapshots"] == {
+        "codex": {"status": 429}
+    }
+    assert result.metadata["provider_decision"] == {
+        "phase": "build",
+        "alias": None,
+        "quota_state": "UNKNOWN",
+        "fallback": False,
+        "forced": False,
+        "reason": "no provider available",
+    }
+
+
+def test_run_phase_cmd_does_not_read_resolver_history_on_failure(monkeypatch):
+    class Resolver:
+        @property
+        def history(self):
+            raise AssertionError("shared resolver history must not be read")
+
+        def resolve(self, *args, **kwargs):
+            raise NoProviderAvailable("dev", {}, {})
+
+    monkeypatch.setattr(
+        runner,
+        "run_cli",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("run_cli must not run without an eligible provider")
+        ),
+    )
+
+    result = runner.run_phase_cmd(
+        "build", "dev", "/tmp/project", Resolver()
+    )
+
+    assert result[2] == 4
+
+
+def test_run_phase_cmd_rejects_ambiguous_cmd_arguments():
+    class Resolver:
+        def resolve(self, *args, **kwargs):
+            raise AssertionError("ambiguous arguments must fail first")
+
+    for resolver, explicit_cmd in (
+        (None, "echo explicit"),
+        (Resolver(), None),
+    ):
+        try:
+            runner.run_phase_cmd(
+                "build",
+                "dev",
+                "/tmp/project",
+                resolver,
+                explicit_cmd=explicit_cmd,
+                cmd="echo legacy",
+            )
+        except TypeError as exc:
+            assert str(exc) == (
+                "cmd may only be supplied when explicit_cmd is None and "
+                "resolver is None"
+            )
+        else:
+            raise AssertionError("ambiguous cmd arguments must raise TypeError")
+
+
+def test_run_phase_cmd_forwards_force_mode_and_expanded_command(monkeypatch):
+    received = []
+
+    class Resolver:
+        def resolve(self, role, *, workdir, force, force_provider):
+            assert (role, force, force_provider) == ("dev", False, "claude")
+            return _decision(
+                f"claude-tmux --cwd {workdir}",
+                alias="claude",
+                forced=True,
+                reason="forced requested provider",
+            )
+
+    def fake_run_cli(cmd, **kwargs):
+        received.append((cmd, kwargs))
+        return runner.RunResult(("", "", 0))
+
+    monkeypatch.setattr(runner, "run_cli", fake_run_cli)
+
+    result = runner.run_phase_cmd(
+        "build",
+        "dev",
+        "/tmp/test",
+        Resolver(),
+        force_provider="claude",
+    )
+
+    assert received[0][0] == "claude-tmux --cwd /tmp/test"
+    assert result.metadata["provider_decision"]["forced"] is True
 
 
 def test_fast_124_retries_once_then_succeeds(monkeypatch):

@@ -16,9 +16,9 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Protocol
 
-from . import costs, gates, providers
+from . import costs, gates, providers, quota
 
 
 DEFAULT_MAX_INPUT_CHARS = 256 * 1024
@@ -74,6 +74,7 @@ _FAIL_ON_KINDS = {
 }
 
 COST_BUDGET_EXIT_CODE = 3
+_NO_PROVIDER_AVAILABLE_EXIT_CODE = 4
 
 
 class RunResult(tuple):
@@ -85,6 +86,123 @@ class RunResult(tuple):
         instance = super().__new__(cls, values)
         instance.metadata = metadata if metadata is not None else {}
         return instance
+
+
+class _ProviderResolver(Protocol):
+    def resolve(
+        self,
+        role: str,
+        *,
+        workdir: str,
+        force: bool = False,
+        force_provider: str | None = None,
+    ) -> quota.ProviderDecision: ...
+
+
+def run_phase_cmd(
+    phase_name: str,
+    role: str,
+    workdir: str,
+    resolver: _ProviderResolver | None,
+    *,
+    explicit_cmd: str | list[str] | tuple[str, ...] | None = None,
+    force: bool = False,
+    force_provider: str | None = None,
+    **run_cli_kwargs: Any,
+) -> RunResult:
+    """Resolve and run the provider command for one pipeline phase.
+
+    An explicitly selected command retains the legacy execution path and must
+    not consult quota state.  The same is true when no resolver was created;
+    in that case callers may supply the already-selected legacy command as
+    either ``explicit_cmd`` or ``cmd``, but not both.  Supplying ``cmd`` with
+    a resolver is invalid because provider resolution selects the command.
+    """
+    execution = dict(run_cli_kwargs)
+    has_legacy_cmd = "cmd" in execution
+    legacy_cmd = execution.pop("cmd", None)
+    execution.setdefault("cwd", workdir)
+    execution.setdefault("phase", phase_name)
+
+    if has_legacy_cmd and (explicit_cmd is not None or resolver is not None):
+        raise TypeError(
+            "cmd may only be supplied when explicit_cmd is None and "
+            "resolver is None"
+        )
+    if explicit_cmd is not None:
+        return run_cli(explicit_cmd, **execution)
+    if resolver is None:
+        return run_cli(legacy_cmd, **execution)
+
+    try:
+        decision = resolver.resolve(
+            role,
+            workdir=workdir,
+            force=force,
+            force_provider=force_provider,
+        )
+    except quota.NoProviderAvailable as exc:
+        # The resolver normally records this decision in its history, but a
+        # caller-provided resolver only needs to implement resolve().  Build a
+        # complete failure decision here so both forms expose stable metadata.
+        decision = _failed_provider_decision(
+            exc,
+            forced=force or force_provider is not None,
+        )
+        metadata = {
+            "error": str(exc),
+            "provider_decision": _provider_decision_dict(
+                phase_name, decision
+            ),
+            "rejection_reasons": dict(exc.reasons),
+            "raw_snapshots": dict(exc.snapshots),
+        }
+        return RunResult(
+            ("", str(exc), _NO_PROVIDER_AVAILABLE_EXIT_CODE), metadata
+        )
+
+    result = run_cli(decision.command, **execution)
+    provider_metadata = _provider_decision_dict(phase_name, decision)
+    if isinstance(result, RunResult):
+        result.metadata["provider_decision"] = provider_metadata
+        return result
+
+    # Test doubles and third-party wrappers may return the historical tuple.
+    # Preserve tuple compatibility while still honoring this API's metadata
+    # guarantee.
+    return RunResult(result, {"provider_decision": provider_metadata})
+
+
+def _failed_provider_decision(
+    error: quota.NoProviderAvailable,
+    *,
+    forced: bool,
+) -> quota.ProviderDecision:
+    return quota.ProviderDecision(
+        alias=None,
+        command=None,
+        quota_state=quota.UNKNOWN,
+        fallback=False,
+        reason="no provider available",
+        raw_snapshot=dict(error.snapshots),
+        forced=forced,
+        error=str(error),
+    )
+
+
+def _provider_decision_dict(
+    phase_name: str,
+    decision: quota.ProviderDecision,
+) -> dict[str, object]:
+    """Return the stable, command-free provider audit representation."""
+    return {
+        "phase": phase_name,
+        "alias": decision.alias,
+        "quota_state": decision.quota_state,
+        "fallback": decision.fallback,
+        "forced": decision.forced,
+        "reason": decision.reason,
+    }
 
 
 class _AnsiStrippingStream:
@@ -1559,5 +1677,6 @@ __all__ = [
     "DEFAULT_RESEARCH_TIMEOUT", "RunResult", "build_final_payload", "ci_exit_code",
     "ci_mode", "ci_print", "ensure_final_payload", "fail_phase",
     "parse_fail_on", "run_cli", "run_delegated", "run_parallel",
+    "run_phase_cmd",
     "run_research",
 ]
