@@ -1,11 +1,13 @@
-"""Render a self-contained HTML report from an adversarial run artifact."""
+"""Render self-contained Markdown and HTML adversarial run reports."""
 
 import json
+import sys
 from html import escape
 from pathlib import Path
 
 
 _REPORT_NAME = "report.html"
+_MARKDOWN_REPORT_NAME = "final.md"
 _ALLOWED_ARTIFACT_SUFFIXES = frozenset({".err", ".json", ".md", ".txt"})
 _MAX_ARTIFACTS = 100
 _MAX_ARTIFACT_CHARS = 128 * 1024
@@ -15,7 +17,11 @@ _VALID_BASIS = frozenset({"spec", "code", "inference", "external"})
 
 
 def render_report(final_json, artifacts=None):
-    """Write ``report.html`` next to *final_json* and return its path.
+    """Write ``final.md`` and ``report.html`` next to *final_json*.
+
+    The HTML path is returned for compatibility with the original reporting
+    API.  The Markdown artifact is always generated from the same validated
+    payload and provider history.
 
     ``artifacts`` may be omitted to discover numbered phase artifacts (for
     example ``01_architect.txt``), supplied as an iterable of paths, or supplied
@@ -26,25 +32,48 @@ def render_report(final_json, artifacts=None):
     Invalid JSON and non-object root values are rejected.  Every field below
     the root is optional and malformed optional values are rendered safely.
     """
-    final_path = Path(final_json)
-    try:
-        payload = json.loads(final_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid final JSON: {exc}") from exc
-
-    if not isinstance(payload, dict):
-        raise ValueError("final JSON must contain an object")
-
+    final_path, payload = _load_final_payload(final_json)
     raw_artifacts = _load_artifacts(final_path, artifacts)
+    provider_history = _provider_history(payload.get("provider_history"))
+    markdown_path = final_path.with_name(_MARKDOWN_REPORT_NAME)
     report_path = final_path.with_name(_REPORT_NAME)
-    document = _render_document(payload, final_path, report_path, raw_artifacts)
+    markdown_path.write_text(
+        _render_markdown_document(
+            payload, final_path, raw_artifacts, provider_history
+        ),
+        encoding="utf-8",
+    )
+    document = _render_document(
+        payload, final_path, report_path, raw_artifacts, provider_history
+    )
     report_path.write_text(document, encoding="utf-8")
     return report_path
 
 
 def render_html_report(final_json, artifacts=None):
-    """Compatibility alias for callers that use an explicit HTML name."""
-    return render_report(final_json, artifacts=artifacts)
+    """Write and return the self-contained HTML report."""
+    final_path, payload = _load_final_payload(final_json)
+    raw_artifacts = _load_artifacts(final_path, artifacts)
+    provider_history = _provider_history(payload.get("provider_history"))
+    report_path = final_path.with_name(_REPORT_NAME)
+    report_path.write_text(
+        _render_document(
+            payload, final_path, report_path, raw_artifacts, provider_history
+        ),
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def _load_final_payload(final_json):
+    final_path = Path(final_json)
+    try:
+        payload = json.loads(final_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid final JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("final JSON must contain an object")
+    return final_path, payload
 
 
 def _load_artifacts(final_path, artifacts):
@@ -128,7 +157,9 @@ def _bounded_text(text, limit):
     return text[:limit - len(marker)] + marker
 
 
-def _render_document(payload, final_path, report_path, artifacts):
+def _render_document(
+    payload, final_path, report_path, artifacts, provider_history
+):
     verdict = payload.get("verdict", payload.get("status", "UNKNOWN"))
     verdict_text = _as_text(verdict) if _is_scalar(verdict) else "UNKNOWN"
     status_class = _status_class(verdict_text)
@@ -139,6 +170,7 @@ def _render_document(payload, final_path, report_path, artifacts):
         _render_epistemic(payload),
         _render_costs(payload.get("costs")),
         _render_execution(payload),
+        _render_provider_history_html(provider_history),
         _render_gates(payload.get("gates")),
         _render_warnings(payload.get("warnings")),
         _render_artifacts(artifacts),
@@ -210,7 +242,8 @@ pre {{ max-height:38rem; margin:0; padding:14px; border-top:1px solid var(--line
 def _render_overview(payload, final_path, report_path):
     excluded = {
         "costs", "delegated", "epistemic_distribution", "epistemic_labels",
-        "finding_details", "findings", "gates", "parallel", "warnings",
+        "finding_details", "findings", "gates", "parallel",
+        "provider_history", "warnings",
     }
     rows = [
         (key, value) for key, value in payload.items()
@@ -326,6 +359,34 @@ def _render_execution(payload):
     return f"<section class=\"panel\"><h2>Execution</h2>{body}</section>"
 
 
+def _render_provider_history_html(history):
+    if not history:
+        body = '<p class="empty">No provider history recorded.</p>'
+    else:
+        rows = "".join(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+            "<td>{}</td><td>{}</td></tr>".format(
+                _escaped(entry["phase"]),
+                _escaped(entry["alias"]),
+                _escaped(entry["quota_state"]),
+                "Yes" if entry["fallback"] else "No",
+                "Yes" if entry["forced"] else "No",
+                _escaped(entry["reason"]),
+            )
+            for entry in history
+        )
+        body = (
+            "<table><thead><tr><th>Phase</th><th>Provider</th>"
+            "<th>State</th><th>Fallback</th><th>Forced</th>"
+            "<th>Reason</th></tr></thead>"
+            f"<tbody>{rows}</tbody></table>"
+        )
+    return (
+        '<section class="panel"><h2>Provider history</h2>'
+        f"{body}</section>"
+    )
+
+
 def _render_gates(gates):
     if gates is None:
         body = '<p class="empty">No gate results were recorded.</p>'
@@ -366,6 +427,148 @@ def _render_artifacts(artifacts):
     else:
         body = '<p class="empty">No numbered phase artifacts were found.</p>'
     return f'<section class="panel"><h2>Raw phase outputs</h2>{body}</section>'
+
+
+def _provider_history(value):
+    """Validate report-facing history and omit malformed entries safely."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        _warn_invalid_provider_history("provider_history must be an array")
+        return []
+
+    history = []
+    for index, entry in enumerate(value):
+        problem = _provider_history_problem(entry)
+        if problem is not None:
+            _warn_invalid_provider_history(
+                f"provider_history entry {index + 1} skipped: {problem}"
+            )
+            continue
+        history.append({
+            "phase": entry["phase"],
+            "alias": entry.get("alias"),
+            "quota_state": entry["quota_state"],
+            "fallback": entry["fallback"],
+            "forced": entry["forced"],
+            "reason": entry["reason"],
+        })
+    return history
+
+
+def _provider_history_problem(entry):
+    if not isinstance(entry, dict):
+        return "entry must be an object"
+    required_types = {
+        "phase": str,
+        "quota_state": str,
+        "fallback": bool,
+        "forced": bool,
+        "reason": str,
+    }
+    for key, expected in required_types.items():
+        if key not in entry or type(entry[key]) is not expected:
+            return f"missing or invalid '{key}'"
+    if entry.get("alias") is not None and type(entry["alias"]) is not str:
+        return "invalid 'alias'"
+    if "raw_snapshot" in entry and not isinstance(entry["raw_snapshot"], dict):
+        return "invalid 'raw_snapshot'"
+    return None
+
+
+def _warn_invalid_provider_history(message):
+    print(f"Provider history validation warning: {message}.", file=sys.stderr)
+
+
+def _render_markdown_document(payload, final_path, artifacts, history):
+    verdict = payload.get("verdict", payload.get("status", "UNKNOWN"))
+    verdict_text = _as_text(verdict) if _is_scalar(verdict) else "UNKNOWN"
+    lines = [
+        "# Adversarial run report",
+        "",
+        f"Verdict: **{_markdown_cell(verdict_text)}**",
+        "",
+        "## Run overview",
+        "",
+        f"Source artifact: `{_markdown_code(final_path)}`",
+    ]
+    summary = payload.get("summary")
+    if _is_scalar(summary) and summary is not None:
+        lines.extend(["", f"Summary: {_markdown_cell(summary)}"])
+
+    lines.extend(["", "## Provider history", ""])
+    if history:
+        lines.extend([
+            "| Phase | Provider | State | Fallback | Forced | Reason |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ])
+        for entry in history:
+            lines.append(
+                "| {} | {} | {} | {} | {} | {} |".format(
+                    _markdown_cell(entry["phase"]),
+                    _markdown_cell(entry["alias"]),
+                    _markdown_cell(entry["quota_state"]),
+                    "Yes" if entry["fallback"] else "No",
+                    "Yes" if entry["forced"] else "No",
+                    _markdown_cell(entry["reason"]),
+                )
+            )
+    else:
+        lines.append("No provider history recorded.")
+
+    lines.extend(["", "## Findings", ""])
+    findings = payload.get("finding_details", payload.get("findings"))
+    if not findings:
+        lines.append("No findings were recorded.")
+    elif isinstance(findings, list):
+        for index, finding in enumerate(findings):
+            if isinstance(finding, dict):
+                heading = finding.get("id", f"Finding {index + 1}")
+                detail = finding.get("summary", finding.get("message", ""))
+                lines.append(
+                    f"- **{_markdown_cell(heading)}:** {_markdown_cell(detail)}"
+                )
+            else:
+                lines.append(f"- {_markdown_cell(_display_text(finding))}")
+    else:
+        lines.append(_markdown_cell(_display_text(findings)))
+
+    lines.extend(["", "## Raw phase outputs", ""])
+    if artifacts:
+        for name, content in artifacts:
+            lines.extend([
+                f"### {_markdown_cell(name)}",
+                "",
+                "```text",
+                _markdown_fenced_text(content),
+                "```",
+                "",
+            ])
+    else:
+        lines.append("No numbered phase artifacts were found.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _markdown_cell(value):
+    text = _as_text(value)
+    return (
+        escape(text, quote=False)
+        .replace("\\", "\\\\")
+        .replace("|", "\\|")
+        .replace("\r\n", "<br>")
+        .replace("\r", "<br>")
+        .replace("\n", "<br>")
+    )
+
+
+def _markdown_code(value):
+    return _as_text(value).replace("`", "\\`").replace("\n", " ")
+
+
+def _markdown_fenced_text(value):
+    # Keep untrusted artifact text inside the fence even when it contains a
+    # same-length closing delimiter.
+    return _as_text(value).replace("```", "` ` `")
 
 
 def _definition_list(items):

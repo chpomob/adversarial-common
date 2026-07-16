@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import random
@@ -75,6 +76,7 @@ _FAIL_ON_KINDS = {
 
 COST_BUDGET_EXIT_CODE = 3
 _NO_PROVIDER_AVAILABLE_EXIT_CODE = 4
+_UNSET = object()
 
 
 class RunResult(tuple):
@@ -202,7 +204,80 @@ def _provider_decision_dict(
         "fallback": decision.fallback,
         "forced": decision.forced,
         "reason": decision.reason,
+        "raw_snapshot": copy.deepcopy(decision.raw_snapshot),
     }
+
+
+def collect_provider_history(results: Sequence[RunResult]) -> list[dict]:
+    """Collect valid provider decisions in phase execution order.
+
+    Explicit-command and legacy results do not carry a provider decision and
+    are intentionally omitted.  Invalid decisions are also omitted so a
+    partially upgraded or third-party runner cannot prevent final artifact
+    generation.
+    """
+    if not isinstance(results, Sequence) or isinstance(
+        results, (str, bytes, bytearray)
+    ):
+        raise TypeError("results must be a sequence")
+
+    history: list[dict] = []
+    for result in results:
+        metadata = getattr(result, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        decision = metadata.get("provider_decision")
+        if decision is None:
+            continue
+        normalized = _validated_provider_decision(decision)
+        if normalized is not None:
+            history.append(normalized)
+    return history
+
+
+def _validated_provider_decision(value: object) -> dict | None:
+    """Return a defensive copy of a provider decision with a valid schema."""
+    if not isinstance(value, Mapping):
+        return None
+
+    required_types = {
+        "phase": str,
+        "quota_state": str,
+        "fallback": bool,
+        "forced": bool,
+        "reason": str,
+    }
+    if any(
+        type(value.get(key)) is not expected
+        for key, expected in required_types.items()
+    ):
+        return None
+    alias = value.get("alias")
+    if alias is not None and type(alias) is not str:
+        return None
+
+    normalized = {
+        "phase": value["phase"],
+        "alias": alias,
+        "quota_state": value["quota_state"],
+        "fallback": value["fallback"],
+        "forced": value["forced"],
+        "reason": value["reason"],
+    }
+    if "raw_snapshot" in value:
+        snapshot = value["raw_snapshot"]
+        if not isinstance(snapshot, Mapping):
+            return None
+        try:
+            snapshot_copy = copy.deepcopy(dict(snapshot))
+            json.dumps(snapshot_copy)
+        except Exception:
+            # Provider metadata is an untrusted artifact boundary.  Custom
+            # snapshot values may raise arbitrary exceptions from
+            # ``__deepcopy__`` as well as the usual serialization errors.
+            return None
+        normalized["raw_snapshot"] = snapshot_copy
+    return normalized
 
 
 class _AnsiStrippingStream:
@@ -426,6 +501,7 @@ def ensure_final_payload(
     findings=None,
     infrastructure=None,
     context=None,
+    provider_history=_UNSET,
     **extra,
 ):
     """Return a complete, JSON-serializable final payload without mutation."""
@@ -454,6 +530,21 @@ def ensure_final_payload(
         result["infrastructure"] = infrastructure
     if context is not None:
         result["context"] = context
+    history_source = provider_history
+    if history_source is _UNSET and "provider_history" in result:
+        history_source = result["provider_history"]
+    if history_source is not _UNSET:
+        if not isinstance(history_source, Sequence) or isinstance(
+            history_source, (str, bytes, bytearray)
+        ):
+            result["provider_history"] = []
+        else:
+            result["provider_history"] = [
+                normalized
+                for item in history_source
+                if (normalized := _validated_provider_decision(item))
+                is not None
+            ]
     result.update(extra)
 
     normalized = _policy_name(result["verdict"])
@@ -1675,7 +1766,7 @@ __all__ = [
     "DEFAULT_RESEARCH_MAX_INPUT_CHARS", "DEFAULT_RESEARCH_MAX_OUTPUT_CHARS",
     "DEFAULT_RESEARCH_MAX_QUERIES", "DEFAULT_RESEARCH_MAX_RESULTS",
     "DEFAULT_RESEARCH_TIMEOUT", "RunResult", "build_final_payload", "ci_exit_code",
-    "ci_mode", "ci_print", "ensure_final_payload", "fail_phase",
+    "ci_mode", "ci_print", "collect_provider_history", "ensure_final_payload", "fail_phase",
     "parse_fail_on", "run_cli", "run_delegated", "run_parallel",
     "run_phase_cmd",
     "run_research",

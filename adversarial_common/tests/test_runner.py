@@ -90,6 +90,7 @@ def test_run_phase_cmd_resolves_command_and_records_decision(monkeypatch):
             "fallback": False,
             "forced": False,
             "reason": "selected first eligible provider",
+            "raw_snapshot": {},
         },
     }
 
@@ -197,6 +198,7 @@ def test_run_phase_cmd_returns_reject_when_no_provider_is_available(monkeypatch)
         "fallback": False,
         "forced": False,
         "reason": "no provider available",
+        "raw_snapshot": {"codex": {"status": 429}},
     }
 
 

@@ -84,6 +84,7 @@ from .runner import (
     ci_exit_code,
     ci_mode,
     ci_print,
+    collect_provider_history,
     ensure_final_payload,
     fail_phase,
     parse_fail_on,
@@ -147,7 +148,7 @@ __all__ = [
     "DEFAULT_RESEARCH_MAX_QUERIES", "DEFAULT_RESEARCH_MAX_RESULTS",
     "DEFAULT_RESEARCH_TIMEOUT",
     "RunResult", "build_final_payload", "ci_exit_code", "ci_mode",
-    "ci_print", "ensure_final_payload", "fail_phase", "parse_fail_on",
+    "ci_print", "collect_provider_history", "ensure_final_payload", "fail_phase", "parse_fail_on",
     "run_cli", "run_delegated", "run_parallel", "run_phase_cmd",
     "run_research",
     # snapshot
