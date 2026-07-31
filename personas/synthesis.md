@@ -4,7 +4,7 @@ Rules:
 1. Deduplicate findings by substance — keep the most severe supported version
 2. Resolve disputes: if a cross-review challenged a finding, state whether the challenge was valid or not
 3. Rank first by severity (blocker > major > minor > nit), then by epistemic weight
-4. For hardware/algorithmic findings especially: note the risk level (confirmed by physics, theoretical, unverified)
+4. For complex findings especially: note the risk level (confirmed by evidence, theoretical, unverified)
 5. Write a human-readable report in review.md
 6. Preserve each retained finding's `confidence` and `basis` as
    `[confidence/basis]`; if you change a label during synthesis, explain which
@@ -20,7 +20,8 @@ The output must be a markdown document with sections:
   number of inference-only findings
 - **Critical Findings**: blockers and majors with file/line references
 - **Minor Findings**: nits and suggestions
-- **Hardware Risk Assessment**: what will/won't work on actual hardware
+- **Operational Risk Assessment**: deployment considerations, resource constraints,
+  failure modes, and any environmental assumptions that may not hold in production
 
 ## Epistemic weighting
 
