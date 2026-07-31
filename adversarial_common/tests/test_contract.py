@@ -283,6 +283,14 @@ _CONTRACT_MUST_EXPORT = frozenset({
     "enhance_cmd_for_project", "default_wrapper_cmd", "run_cmd",
     # snapshot
     "snapshot_workdir",
+    # pipeline lifecycle
+    "SETTLED_STATUSES", "FinishPolicy", "GitSetupPolicy", "PreflightPolicy",
+    "PreflightResult", "RestorePolicy", "RestoreResult",
+    "RetrospectivePolicy", "banner", "ci_exit_from_final",
+    "ensure_finding_ids", "finish_pipeline", "is_settled_status",
+    "log_retrospective", "non_negative_int", "phase_failure",
+    "positive_int", "preflight", "record_phase", "restore_git", "setup_git",
+    "threshold_overrides", "unresolved_findings", "write_json",
     # personas
     "PERSONAS_DIR", "load_persona", "persona_path",
     # jsonio extras
@@ -297,6 +305,55 @@ def test_contract_exports_match_expected():
 
 def test_process_termination_api_is_exported():
     assert ac.terminate_active_processes is runner.terminate_active_processes
+
+
+def test_pipeline_lifecycle_exports_are_package_level_aliases():
+    from adversarial_common import pipeline_base
+
+    for name in pipeline_base.__all__:
+        assert getattr(ac, name) is getattr(pipeline_base, name)
+
+
+def test_pipeline_base_dependency_boundary_excludes_consumers_and_providers():
+    path = Path(__file__).parents[1] / "pipeline_base.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported = {
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    imported.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    forbidden_fragments = {
+        "providers", "phases", "adversarial_spec", "adversarial_plan",
+        "adversarial_loop", "adversarial_review",
+    }
+    assert not {
+        name for name in imported
+        if any(fragment in name for fragment in forbidden_fragments)
+    }
+
+
+def test_p22_does_not_import_pipeline_base_in_consumers():
+    skills = Path(__file__).parents[3]
+    consumers = [
+        skills / "adversarial-spec/scripts/adversarial_spec.py",
+        skills / "adversarial-plan/scripts/adversarial_plan.py",
+        skills / "adversarial-code-loop/scripts/adversarial_loop_v4.py",
+        skills / "adversarial-code-review/scripts/adversarial_review.py",
+    ]
+    for path in consumers:
+        assert path.is_file(), f"missing consumer: {path}"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "adversarial_common.pipeline_base"
+            for node in ast.walk(tree)
+        ), f"P22 must not migrate {path}"
 
 
 # -- R12: Shared fixtures are available -------------------------------------
