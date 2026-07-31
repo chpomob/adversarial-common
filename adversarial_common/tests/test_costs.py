@@ -1,5 +1,6 @@
 """Acceptance tests for phase- and persona-aware cost accounting."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 
@@ -109,6 +110,83 @@ def test_provider_only_model_ids_use_priced_default_families():
 
     assert ledger.price_for("codex") == ledger.price_for("gpt-5")
     assert ledger.price_for("claude") == ledger.price_for("claude-sonnet-4")
+
+
+@pytest.mark.parametrize(
+    ("identifier", "canonical"),
+    [
+        ("glm-5.2", "glm-5.2"),
+        ("glm", "glm-5.2"),
+        ("zai", "glm-5.2"),
+        ("z-ai/glm-5.2", "glm-5.2"),
+        ("zai/glm-5.2", "glm-5.2"),
+        ("deepseek-v4-pro", "deepseek-v4-pro"),
+        ("deepseek", "deepseek-v4-pro"),
+        ("deepseek/deepseek-v4-pro", "deepseek-v4-pro"),
+        ("gemini", "gemini-3-flash-preview"),
+        ("google", "gemini-3-flash-preview"),
+        ("gemini-3-flash-preview", "gemini-3-flash-preview"),
+        ("gemini/gemini-3-flash-preview", "gemini-3-flash-preview"),
+        ("google/gemini-3-flash-preview", "gemini-3-flash-preview"),
+        ("gemini-3.5-flash", "gemini-3.5-flash"),
+        ("gemini/gemini-3.5-flash", "gemini-3.5-flash"),
+        ("google/gemini-3.5-flash", "gemini-3.5-flash"),
+    ],
+)
+def test_default_suite_model_identifiers_and_aliases_are_priced(
+    identifier, canonical
+):
+    ledger = CostLedger(env={})
+
+    price = ledger.price_for(identifier)
+
+    assert price == ledger.price_for(canonical)
+    assert price["prompt"] > 0
+    assert price["completion"] > 0
+
+
+def test_default_model_aliases_follow_environment_price_overrides():
+    ledger = CostLedger(
+        env={
+            "ADVERSARIAL_MODEL_PRICES": (
+                '{"glm-5.2":{"prompt":9,"completion":10}}'
+            )
+        }
+    )
+
+    assert ledger.price_for("zai/glm-5.2") == {
+        "prompt": 9.0,
+        "completion": 10.0,
+    }
+
+
+def test_glm_usage_has_nonzero_total_and_stable_json_serialization():
+    ledger = CostLedger(env={})
+    record = ledger.record(
+        "glm-5.2",
+        usage={"input_tokens": 1_000, "output_tokens": 500},
+        phase="review",
+        persona="critic",
+    )
+
+    summary = ledger.summary()
+    serialized = json.dumps(summary, sort_keys=True, separators=(",", ":"))
+
+    assert record.est_cost_usd == 0.0036
+    assert summary["total"]["est_cost_usd"] == 0.0036
+    assert serialized == (
+        '{"models":{"glm-5.2":{"completion_tokens":500,'
+        '"est_cost_usd":0.0036,"estimated":false,"prompt_tokens":1000}},'
+        '"personas":{"critic":{"completion_tokens":500,'
+        '"est_cost_usd":0.0036,"estimated":false,"prompt_tokens":1000}},'
+        '"phases":{"review":{"completion_tokens":500,'
+        '"est_cost_usd":0.0036,"estimated":false,"prompt_tokens":1000}},'
+        '"records":[{"completion_tokens":500,"est_cost_usd":0.0036,'
+        '"estimated":false,"model":"glm-5.2","persona":"critic",'
+        '"phase":"review","prompt_tokens":1000}],"total":'
+        '{"completion_tokens":500,"est_cost_usd":0.0036,'
+        '"prompt_tokens":1000}}'
+    )
 
 
 def test_usage_records_and_record_snapshots_are_immutable():

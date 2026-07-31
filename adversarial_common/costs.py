@@ -18,6 +18,10 @@ _COST_PRECISION: Final = Decimal("0.0000000001")
 
 # USD per million tokens. Dated model ids inherit the longest matching family
 # prefix. Unknown models remain trackable at a zero price.
+# Standard, uncached text rates checked 2026-07-31:
+# - Z.AI: https://docs.z.ai/guides/overview/pricing
+# - DeepSeek: https://api-docs.deepseek.com/quick_start/pricing
+# - Gemini: https://ai.google.dev/gemini-api/docs/pricing
 MODEL_PRICES: Final[dict[str, dict[str, float]]] = {
     "claude-opus-4": {"prompt": 15.0, "completion": 75.0},
     "claude-sonnet-4": {"prompt": 3.0, "completion": 15.0},
@@ -25,15 +29,31 @@ MODEL_PRICES: Final[dict[str, dict[str, float]]] = {
     "claude-3-5-haiku": {"prompt": 0.8, "completion": 4.0},
     "gpt-5": {"prompt": 1.25, "completion": 10.0},
     "gpt-5-mini": {"prompt": 0.25, "completion": 2.0},
+    "glm-5.2": {"prompt": 1.4, "completion": 4.4},
+    "deepseek-v4-pro": {"prompt": 0.435, "completion": 0.87},
+    "gemini-3-flash-preview": {"prompt": 0.5, "completion": 3.0},
+    "gemini-3.5-flash": {"prompt": 1.5, "completion": 9.0},
 }
 
-# Provider commands intentionally omit a model when the provider's own default
-# should be used. Attribute those calls to a documented priced family instead
-# of silently treating the provider executable name as an unknown free model.
+# Provider commands may omit a model or usage history may qualify it with a
+# provider name. Attribute those identifiers to a documented priced family
+# instead of silently treating them as unknown free models.
 PROVIDER_PRICE_ALIASES: Final[dict[str, str]] = {
     "codex": "gpt-5",
     "claude": "claude-sonnet-4",
     "claude-tmux": "claude-sonnet-4",
+    "glm": "glm-5.2",
+    "zai": "glm-5.2",
+    "z-ai/glm-5.2": "glm-5.2",
+    "zai/glm-5.2": "glm-5.2",
+    "deepseek": "deepseek-v4-pro",
+    "deepseek/deepseek-v4-pro": "deepseek-v4-pro",
+    "gemini": "gemini-3-flash-preview",
+    "google": "gemini-3-flash-preview",
+    "gemini/gemini-3-flash-preview": "gemini-3-flash-preview",
+    "gemini/gemini-3.5-flash": "gemini-3.5-flash",
+    "google/gemini-3-flash-preview": "gemini-3-flash-preview",
+    "google/gemini-3.5-flash": "gemini-3.5-flash",
 }
 
 
