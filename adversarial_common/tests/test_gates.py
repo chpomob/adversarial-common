@@ -52,6 +52,22 @@ def test_spec_requires_requirements_section():
 
     assert result["ok"] is False
     assert result["reason"] == "missing_required_section:Requirements"
+    assert result["thresholds"]["required_sections"] == ["Requirements"]
+
+
+def test_spec_with_requirements_section_is_accepted():
+    text = (
+        "# Overview\n"
+        "A detailed design with enough context for the pipeline gate.\n\n"
+        "## Requirements\n"
+        "- R1: The implementation preserves the documented public contract.\n"
+        "- R2: Verification covers the expected behavior in detail.\n"
+    )
+
+    result = check_context("spec", text)
+
+    assert result["ok"] is True
+    assert result["reason"] == "ok"
 
 
 def test_diff_with_no_source_lines_is_blocked():

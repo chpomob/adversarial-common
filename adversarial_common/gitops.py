@@ -83,11 +83,13 @@ def detect_enclosing_repo(workdir):
 
 
 def auto_init(workdir):
-    """``git init`` *workdir*, pin a stable identity and branch, first commit.
+    """``git init`` *workdir*, ensure an identity and create the first commit.
 
-    Sets repo-local ``user.name`` / ``user.email`` (adversarial-loop /
-    loop@adversarial.local) so commits never fail on missing identity, and pins
-    the initial branch to ``main`` regardless of the host's ``init.defaultBranch``.
+    Preserves configured ``user.name`` / ``user.email`` values. For each value
+    that is not configured locally, globally, or system-wide, sets the repo-local
+    fallback (adversarial-loop / loop@adversarial.local) so commits do not fail.
+    Pins the initial branch to ``main`` regardless of the host's
+    ``init.defaultBranch``.
 
     Safety guard: refuses to auto-initialize when *workdir* contains child
     directories that are themselves git repositories. This prevents the pipeline
@@ -133,8 +135,9 @@ def _find_child_repos(workdir):
 
 
 def ensure_git_identity(workdir):
-    """Set repo-local user.name/user.email when no identity is configured
-    anywhere (local/global/system). Existing config is never overridden.
+    """Set a repo-local fallback for each missing identity value.
+
+    Values configured locally, globally, or system-wide are never overridden.
     """
     name, email = _LOOP_IDENTITY
     for key, value in (("user.name", name), ("user.email", email)):

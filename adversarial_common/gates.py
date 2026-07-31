@@ -17,7 +17,12 @@ TRUNCATION_MARKER: Final = "\n[TRUNCATED]\n"
 
 _DEFAULT_THRESHOLDS: Final[dict[str, dict[str, Any]]] = {
     "brief": {"min_chars": 40, "min_tokens": 10, "required_sections": [], "min_source_lines": 0},
-    "spec": {"min_chars": 100, "min_tokens": 25, "required_sections": [], "min_source_lines": 0},
+    "spec": {
+        "min_chars": 100,
+        "min_tokens": 25,
+        "required_sections": ["Requirements"],
+        "min_source_lines": 0,
+    },
     "diff": {"min_chars": 1, "min_tokens": 1, "required_sections": [], "min_source_lines": 1},
     "input": {"min_chars": 20, "min_tokens": 5, "required_sections": [], "min_source_lines": 0},
 }
