@@ -1,6 +1,10 @@
 """Retry and cap acceptance tests for the canonical CLI runner."""
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -41,6 +45,29 @@ def _decision(command="echo build", **overrides):
     }
     values.update(overrides)
     return ProviderDecision(**values)
+
+
+def _active_processes():
+    with runner._ACTIVE_PROCESSES_LOCK:
+        return tuple(runner._ACTIVE_PROCESSES)
+
+
+def _wait_until(predicate, timeout=3):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
+
+
+def _pid_is_running(pid):
+    try:
+        stat = os.path.join("/proc", str(pid), "stat")
+        with open(stat, encoding="utf-8") as handle:
+            return handle.read().split()[2] != "Z"
+    except FileNotFoundError:
+        return False
 
 
 def test_run_phase_cmd_resolves_command_and_records_decision(monkeypatch):
@@ -323,6 +350,243 @@ def test_missing_binary_is_recorded_once_without_sleep():
     assert result[2] == 127
     assert len(result.metadata["attempts"]) == 1
     assert result.metadata["attempts"][0]["reason"] == "permanent"
+
+
+def test_registry_is_empty_after_normal_and_timeout_execution():
+    normal = runner.run_cli(
+        [sys.executable, "-c", "print('done')"], max_retries=0
+    )
+    timed_out = runner.run_cli(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        timeout=0.05,
+        max_retries=0,
+    )
+
+    assert tuple(normal) == ("done", "", 0)
+    assert timed_out[2] == 124
+    assert _active_processes() == ()
+
+
+def test_started_process_is_cleaned_up_when_communicate_is_interrupted(
+    monkeypatch,
+):
+    signals = []
+
+    class InterruptedProcess:
+        pid = 999_999_999
+        returncode = None
+
+        def communicate(self, **kwargs):
+            raise KeyboardInterrupt
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = InterruptedProcess()
+
+    def signal_process_group(target, sig):
+        assert target is process
+        signals.append(sig)
+        if sig == signal.SIGKILL:
+            target.returncode = -sig
+
+    monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: process)
+    monkeypatch.setattr(runner, "_signal_process_group", signal_process_group)
+    monkeypatch.setattr(runner, "_TERMINATION_GRACE_SECONDS", 0)
+
+    try:
+        runner._execute_attempt(["provider"], None, 30, None)
+    except KeyboardInterrupt:
+        pass
+    else:
+        raise AssertionError("the provider interrupt must propagate")
+
+    assert signals == [signal.SIGTERM, signal.SIGKILL]
+    assert _active_processes() == ()
+
+
+def test_reaped_process_group_is_not_probed(monkeypatch):
+    probes = []
+
+    class ReapedProcess:
+        pid = 1234
+
+        def poll(self):
+            return 0
+
+    monkeypatch.setattr(
+        runner.os,
+        "killpg",
+        lambda pid, sig: probes.append((pid, sig)),
+    )
+
+    assert not runner._process_group_is_active(ReapedProcess())
+    assert probes == []
+
+
+def test_process_creation_and_registration_are_atomic_with_cleanup(monkeypatch):
+    popen_entered = threading.Event()
+    release_popen = threading.Event()
+    cleanup_started = threading.Event()
+    cleanup_finished = threading.Event()
+    terminated = threading.Event()
+    signals = []
+
+    class BlockingProcess:
+        pid = 999_999_998
+        returncode = None
+
+        def communicate(self, **kwargs):
+            assert terminated.wait(3)
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    process = BlockingProcess()
+
+    def create_process(*args, **kwargs):
+        popen_entered.set()
+        assert release_popen.wait(3)
+        return process
+
+    def signal_process_group(target, sig):
+        assert target is process
+        signals.append(sig)
+        target.returncode = -sig
+        terminated.set()
+
+    def cleanup():
+        cleanup_started.set()
+        runner.terminate_active_processes()
+        cleanup_finished.set()
+
+    monkeypatch.setattr(runner.subprocess, "Popen", create_process)
+    monkeypatch.setattr(runner, "_signal_process_group", signal_process_group)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempt = pool.submit(
+            runner._execute_attempt, ["provider"], None, 30, None
+        )
+        assert popen_entered.wait(3)
+        cleanup_call = pool.submit(cleanup)
+        assert cleanup_started.wait(3)
+        assert not cleanup_finished.wait(0.05)
+
+        release_popen.set()
+
+        cleanup_call.result(timeout=3)
+        assert attempt.result(timeout=3)[2] == -signal.SIGTERM
+
+    assert signals == [signal.SIGTERM]
+    assert _active_processes() == ()
+
+
+def test_terminate_active_processes_handles_concurrent_repeated_cleanup():
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(
+            runner.run_cli,
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            max_retries=0,
+        )
+        assert _wait_until(lambda: len(_active_processes()) == 1)
+
+        with ThreadPoolExecutor(max_workers=4) as terminators:
+            calls = [
+                terminators.submit(runner.terminate_active_processes)
+                for _ in range(4)
+            ]
+            for call in calls:
+                call.result(timeout=3)
+
+        assert result.result(timeout=3)[2] != 0
+
+    runner.terminate_active_processes()
+    assert _active_processes() == ()
+
+
+def test_terminate_active_processes_allows_graceful_sigterm_exit(tmp_path):
+    ready_path = tmp_path / "ready"
+    script = (
+        "import signal, sys, time\n"
+        "def stop(*args):\n"
+        "    time.sleep(0.2)\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGTERM, stop)\n"
+        f"open({str(ready_path)!r}, 'w').close()\n"
+        "time.sleep(30)\n"
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(
+            runner.run_cli,
+            [sys.executable, "-c", script],
+            max_retries=0,
+        )
+        assert _wait_until(ready_path.exists)
+
+        runner.terminate_active_processes()
+
+        assert result.result(timeout=3)[2] == 0
+
+    assert _active_processes() == ()
+
+
+def test_terminate_active_processes_ignores_already_exited_child():
+    process = subprocess.Popen(
+        [sys.executable, "-c", "pass"], start_new_session=True
+    )
+    process.wait(timeout=3)
+    runner._register_process(process)
+
+    runner.terminate_active_processes()
+    runner.terminate_active_processes()
+
+    assert _active_processes() == ()
+
+
+def test_terminate_active_processes_kills_provider_process_tree(tmp_path):
+    grandchild_pid_path = tmp_path / "grandchild.pid"
+    script = (
+        "import signal, subprocess, sys, time; "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "child = subprocess.Popen([sys.executable, '-c', "
+        "'import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "time.sleep(30)']); "
+        f"open({str(grandchild_pid_path)!r}, 'w').write(str(child.pid)); "
+        "time.sleep(30)"
+    )
+    provider_pid = None
+    grandchild_pid = None
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(
+                runner.run_cli,
+                [sys.executable, "-c", script],
+                max_retries=0,
+            )
+            assert _wait_until(grandchild_pid_path.exists)
+            provider_pid = _active_processes()[0].pid
+            grandchild_pid = int(grandchild_pid_path.read_text())
+
+            runner.terminate_active_processes()
+
+            assert result.result(timeout=3)[2] != 0
+
+        assert _wait_until(lambda: not _pid_is_running(provider_pid))
+        assert _wait_until(lambda: not _pid_is_running(grandchild_pid))
+        assert _active_processes() == ()
+    finally:
+        if provider_pid is not None:
+            try:
+                os.killpg(provider_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_missing_wrapper_diagnostic_names_command_and_configuration(monkeypatch):

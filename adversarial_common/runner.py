@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -77,6 +78,102 @@ _FAIL_ON_KINDS = {
 COST_BUDGET_EXIT_CODE = 3
 _NO_PROVIDER_AVAILABLE_EXIT_CODE = 4
 _UNSET = object()
+
+# Provider commands run in their own sessions, so each process PID is also its
+# process-group ID.  Keep strong references only while an attempt is active;
+# the lock protects both normal runner threads and interrupt-time cleanup.
+_ACTIVE_PROCESSES: set[subprocess.Popen] = set()
+_ACTIVE_PROCESSES_LOCK = threading.Lock()
+_TERMINATE_ACTIVE_LOCK = threading.Lock()
+_TERMINATION_GRACE_SECONDS = 2.0
+_TERMINATION_POLL_SECONDS = 0.01
+
+
+def _register_process(process: subprocess.Popen) -> None:
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES.add(process)
+
+
+def _unregister_process(process: subprocess.Popen) -> None:
+    with _ACTIVE_PROCESSES_LOCK:
+        _ACTIVE_PROCESSES.discard(process)
+
+
+def _signal_process_group(process: subprocess.Popen, sig: int) -> None:
+    """Signal an attempt's whole process group, tolerating concurrent exit."""
+    try:
+        os.killpg(process.pid, sig)
+    except (AttributeError, ProcessLookupError, OSError):
+        # ``killpg`` is unavailable on some platforms.  The Popen fallback
+        # still cleans up the direct child and keeps this API best-effort.
+        try:
+            if sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except (AttributeError, ProcessLookupError, OSError):
+            pass
+
+
+def _process_group_is_active(process: subprocess.Popen) -> bool:
+    """Return whether a process group with its original leader remains.
+
+    Do not probe the numeric group ID after ``poll()`` has reaped the leader.
+    At that point its PID may be reused for an unrelated process group.
+    """
+    if process.poll() is not None:
+        return False
+    try:
+        os.killpg(process.pid, 0)
+    except (AttributeError, ProcessLookupError, OSError):
+        return True
+    return True
+
+
+def terminate_active_processes() -> None:
+    """Gracefully terminate all tracked provider process groups.
+
+    Calls are serialized so interrupt handlers and worker threads may invoke
+    cleanup concurrently.  Processes that exit during cleanup are harmless,
+    and a subsequent call is a no-op once the registry is empty.
+    """
+    with _TERMINATE_ACTIVE_LOCK:
+        with _ACTIVE_PROCESSES_LOCK:
+            processes = tuple(_ACTIVE_PROCESSES)
+        _terminate_processes(processes)
+
+
+def _terminate_processes(processes: Sequence[subprocess.Popen]) -> None:
+    """Terminate and reap a fixed snapshot of provider processes."""
+    if not processes:
+        return
+
+    for process in processes:
+        if _process_group_is_active(process):
+            _signal_process_group(process, signal.SIGTERM)
+
+    deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
+    while any(_process_group_is_active(process) for process in processes):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(_TERMINATION_POLL_SECONDS, remaining))
+
+    for process in processes:
+        if _process_group_is_active(process):
+            _signal_process_group(process, signal.SIGKILL)
+
+    # Reap direct children after SIGKILL.  Use one shared deadline so the
+    # cleanup duration remains bounded even with many concurrent attempts.
+    kill_deadline = time.monotonic() + _TERMINATION_GRACE_SECONDS
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=max(0.0, kill_deadline - time.monotonic()))
+            except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
+                pass
+        if process.poll() is not None:
+            _unregister_process(process)
 
 
 class RunResult(tuple):
@@ -1246,45 +1343,72 @@ def _research_json_safe(value):
 def _execute_attempt(argv, stdin_text, timeout, cwd):
     out_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
     err_f = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")
+    proc = None
     try:
-        try:
-            proc = subprocess.Popen(
-                argv,
-                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-                stdout=out_f,
-                stderr=err_f,
-                text=True,
-                cwd=cwd,
-                start_new_session=True,
-            )
-        except FileNotFoundError:
-            missing_command = str(argv[0])
-            if providers.detect_provider(argv) == "claude-tmux":
-                diagnostic = (
-                    "Claude wrapper command not found: "
-                    f"{shlex.quote(missing_command)}. Set "
-                    f"{providers.CLAUDE_TMUX_PATH_ENV} to the wrapper path "
-                    f"or install {missing_command} on PATH."
-                )
-            else:
-                diagnostic = f"Command not found: {shlex.quote(missing_command)}"
-            return "", diagnostic, 127, False, False
-        except OSError as exc:
-            return "", f"OS error: {exc}", -1, False, False
-        try:
-            proc.communicate(input=stdin_text, timeout=timeout)
-        except subprocess.TimeoutExpired:
+        # Hold the cleanup lock across creation and registration.  Cleanup
+        # therefore observes either no child yet or a fully registered one,
+        # never a live process in the gap between those two operations.
+        with _TERMINATE_ACTIVE_LOCK:
             try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            proc.wait()
+                proc = subprocess.Popen(
+                    argv,
+                    stdin=(
+                        subprocess.PIPE
+                        if stdin_text is not None
+                        else subprocess.DEVNULL
+                    ),
+                    stdout=out_f,
+                    stderr=err_f,
+                    text=True,
+                    cwd=cwd,
+                    start_new_session=True,
+                )
+            except FileNotFoundError:
+                missing_command = str(argv[0])
+                if providers.detect_provider(argv) == "claude-tmux":
+                    diagnostic = (
+                        "Claude wrapper command not found: "
+                        f"{shlex.quote(missing_command)}. Set "
+                        f"{providers.CLAUDE_TMUX_PATH_ENV} to the wrapper path "
+                        f"or install {missing_command} on PATH."
+                    )
+                else:
+                    diagnostic = (
+                        f"Command not found: {shlex.quote(missing_command)}"
+                    )
+                return "", diagnostic, 127, False, False
+            except OSError as exc:
+                return "", f"OS error: {exc}", -1, False, False
+            _register_process(proc)
+        try:
+            try:
+                proc.communicate(input=stdin_text, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                _signal_process_group(proc, signal.SIGKILL)
+                proc.wait()
+                out_f.seek(0)
+                stdout = out_f.read().strip()
+                return stdout, f"TIMEOUT after {timeout}s", 124, True, True
             out_f.seek(0)
-            stdout = out_f.read().strip()
-            return stdout, f"TIMEOUT after {timeout}s", 124, True, True
-        out_f.seek(0)
-        err_f.seek(0)
-        return out_f.read().strip(), err_f.read().strip(), proc.returncode, True, False
+            err_f.seek(0)
+            return (
+                out_f.read().strip(),
+                err_f.read().strip(),
+                proc.returncode,
+                True,
+                False,
+            )
+        finally:
+            _unregister_process(proc)
+    except BaseException:
+        # An interrupt can land after Popen returns but before registration, or
+        # while communicate() is unwinding.  Clean up the local process even
+        # if it is no longer visible in the global registry.
+        if proc is not None:
+            with _TERMINATE_ACTIVE_LOCK:
+                _terminate_processes((proc,))
+            _unregister_process(proc)
+        raise
     finally:
         out_f.close()
         err_f.close()
@@ -1780,6 +1904,6 @@ __all__ = [
     "DEFAULT_RESEARCH_TIMEOUT", "RunResult", "build_final_payload", "ci_exit_code",
     "ci_mode", "ci_print", "collect_provider_history", "ensure_final_payload", "fail_phase",
     "parse_fail_on", "run_cli", "run_delegated", "run_parallel",
-    "run_phase_cmd",
+    "run_phase_cmd", "terminate_active_processes",
     "run_research",
 ]

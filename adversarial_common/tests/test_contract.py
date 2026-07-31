@@ -264,6 +264,7 @@ _CONTRACT_MUST_EXPORT = frozenset({
     "resume_artifact", "write_final_json",
     # runner
     "run_cli", "run_parallel", "run_delegated", "run_research",
+    "terminate_active_processes",
     "ci_exit_code", "ensure_final_payload", "parse_fail_on",
     "CI_EXIT_CLEAN", "CI_EXIT_BLOCKING", "CI_EXIT_NON_BLOCKING",
     "CI_EXIT_INFRASTRUCTURE", "CI_EXIT_CONTEXT_BLOCKED",
@@ -292,6 +293,10 @@ _CONTRACT_MUST_EXPORT = frozenset({
 def test_contract_exports_match_expected():
     missing = _CONTRACT_MUST_EXPORT - _INIT_EXPORTS
     assert not missing, f"missing from __all__: {sorted(missing)}"
+
+
+def test_process_termination_api_is_exported():
+    assert ac.terminate_active_processes is runner.terminate_active_processes
 
 
 # -- R12: Shared fixtures are available -------------------------------------

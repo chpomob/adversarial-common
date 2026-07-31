@@ -93,6 +93,7 @@ from .runner import (
     run_parallel,
     run_phase_cmd,
     run_research,
+    terminate_active_processes,
 )
 from .snapshot import snapshot_workdir
 
@@ -150,7 +151,7 @@ __all__ = [
     "RunResult", "build_final_payload", "ci_exit_code", "ci_mode",
     "ci_print", "collect_provider_history", "ensure_final_payload", "fail_phase", "parse_fail_on",
     "run_cli", "run_delegated", "run_parallel", "run_phase_cmd",
-    "run_research",
+    "run_research", "terminate_active_processes",
     # snapshot
     "snapshot_workdir",
     # personas
