@@ -18,9 +18,7 @@ DEFAULT_PROVIDER_CONFIG_PATH: Final = Path("~/.config/adversarial/providers.yaml
 PROVIDER_CONFIG_ENV: Final = "ADVERSARIAL_PROVIDER_CONFIG"
 CLAUDE_TMUX_PATH_ENV: Final = "ADVERSARIAL_CLAUDE_TMUX_PATH"
 _CLAUDE_TMUX_EXECUTABLE: Final = "claude-tmux.py"
-_CLAUDE_TMUX_FALLBACK: Final = Path(
-    "~/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py"
-)
+_CLAUDE_TMUX_FALLBACK: Final = Path.home() / "claude-tmux-wrapper" / "claude-tmux.py"
 _TRUSTED_PERSONA_END: Final = "--- END TRUSTED PERSONA ---"
 _UNTRUSTED_BODY_BEGIN: Final = "--- BEGIN UNTRUSTED CONTENT ---"
 _UNTRUSTED_BODY_END: Final = "--- END UNTRUSTED CONTENT ---"
