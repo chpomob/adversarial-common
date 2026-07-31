@@ -325,6 +325,19 @@ def test_missing_binary_is_recorded_once_without_sleep():
     assert result.metadata["attempts"][0]["reason"] == "permanent"
 
 
+def test_missing_wrapper_diagnostic_names_command_and_configuration(monkeypatch):
+    def missing_wrapper(*args, **kwargs):
+        raise FileNotFoundError("missing wrapper")
+
+    monkeypatch.setattr(runner.subprocess, "Popen", missing_wrapper)
+    result = runner.run_cli(["claude-tmux.py"], max_retries=0)
+
+    assert result[2] == 127
+    assert "Claude wrapper command not found: claude-tmux.py" in result[1]
+    assert "ADVERSARIAL_CLAUDE_TMUX_PATH" in result[1]
+    assert "PATH" in result[1]
+
+
 def test_hard_4xx_is_not_retried(monkeypatch):
     _attempts(monkeypatch, [("", "HTTP 401 Unauthorized", 1, True, False)])
     result = runner.run_cli(
@@ -396,6 +409,33 @@ def test_input_cap_can_head_truncate_with_marker(monkeypatch):
     assert len(transmitted[0]) == 30
     assert transmitted[0].endswith(gates.TRUNCATION_MARKER)
     assert result.metadata["cap_events"][0]["kind"] == "input"
+
+
+def test_run_cli_delimits_persona_from_untrusted_input(monkeypatch, tmp_path):
+    persona = tmp_path / "persona.md"
+    persona.write_text("TRUSTED PERSONA")
+    transmitted = []
+
+    def execute(argv, stdin_text, timeout, cwd):
+        transmitted.append(stdin_text)
+        return "ok", "", 0, True, False
+
+    monkeypatch.setattr(runner, "_execute_attempt", execute)
+    result = runner.run_cli(
+        ["codex"],
+        stdin_text="UNTRUSTED BODY",
+        persona_file=persona,
+        clock=FakeClock([0.0, 0.1]),
+    )
+
+    assert result[2] == 0
+    assert transmitted == [
+        "TRUSTED PERSONA\n\n"
+        "--- END TRUSTED PERSONA ---\n"
+        "--- BEGIN UNTRUSTED CONTENT ---\n"
+        "UNTRUSTED BODY\n"
+        "--- END UNTRUSTED CONTENT ---"
+    ]
 
 
 def test_output_cap_is_marked_and_recorded(monkeypatch):

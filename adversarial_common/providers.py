@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shlex
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,6 +16,14 @@ from typing import Final, Mapping
 
 DEFAULT_PROVIDER_CONFIG_PATH: Final = Path("~/.config/adversarial/providers.yaml")
 PROVIDER_CONFIG_ENV: Final = "ADVERSARIAL_PROVIDER_CONFIG"
+CLAUDE_TMUX_PATH_ENV: Final = "ADVERSARIAL_CLAUDE_TMUX_PATH"
+_CLAUDE_TMUX_EXECUTABLE: Final = "claude-tmux.py"
+_CLAUDE_TMUX_FALLBACK: Final = Path(
+    "~/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py"
+)
+_TRUSTED_PERSONA_END: Final = "--- END TRUSTED PERSONA ---"
+_UNTRUSTED_BODY_BEGIN: Final = "--- BEGIN UNTRUSTED CONTENT ---"
+_UNTRUSTED_BODY_END: Final = "--- END UNTRUSTED CONTENT ---"
 _ROLE_OVERRIDE_PREFIX: Final = "ADVERSARIAL_"
 _ROLE_OVERRIDE_SUFFIX: Final = "_PROVIDERS"
 _ROLE_NAME_RE: Final = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -665,17 +674,32 @@ def persona_for_role(role_name, cmd):
     return f"{role_name}-pi" if detect_provider(cmd) == "pi" else role_name
 
 
-def inject_persona(argv, persona_file, stdin_text):
-    """Inject a persona natively for Claude and through stdin otherwise."""
+def inject_persona(argv, persona_file, stdin_text, delimiter=False):
+    """Inject a persona, optionally fencing the untrusted stdin body."""
     if detect_provider(argv) == "claude":
+        if delimiter:
+            stdin_text = _delimit_untrusted_body(stdin_text)
         return argv + ["--append-system-prompt-file", persona_file], stdin_text
     try:
         persona_text = Path(persona_file).read_text()
     except OSError:
         persona_text = ""
     if persona_text:
-        stdin_text = f"{persona_text}\n\n{stdin_text or ''}"
+        if delimiter:
+            stdin_text = (
+                f"{persona_text}\n\n{_TRUSTED_PERSONA_END}\n"
+                f"{_delimit_untrusted_body(stdin_text)}"
+            )
+        else:
+            stdin_text = f"{persona_text}\n\n{stdin_text or ''}"
+    elif delimiter:
+        stdin_text = _delimit_untrusted_body(stdin_text)
     return argv, stdin_text
+
+
+def _delimit_untrusted_body(stdin_text):
+    body = stdin_text or ""
+    return f"{_UNTRUSTED_BODY_BEGIN}\n{body}\n{_UNTRUSTED_BODY_END}"
 
 
 def enhance_cmd_for_project(cmd, project_path):
@@ -726,12 +750,22 @@ def resolve_role_cmd(
 
 
 def default_wrapper_cmd(extra_flags=""):
-    """Return the default Claude wrapper command without pinning a model."""
-    wrapper = os.path.expanduser(
-        "~/.hermes/skills/autonomous-ai-agents/hermes-agent/scripts/claude-tmux.py"
-    )
-    cmd = f"python3 {wrapper} --yolo"
-    return f"{cmd} {extra_flags}".strip()
+    """Return the discovered Claude wrapper command without pinning a model."""
+    override = os.environ.get(CLAUDE_TMUX_PATH_ENV, "").strip()
+    if override:
+        wrapper = os.path.expanduser(override)
+    else:
+        wrapper = shutil.which(_CLAUDE_TMUX_EXECUTABLE)
+        fallback = _CLAUDE_TMUX_FALLBACK.expanduser()
+        if wrapper is None and fallback.is_file():
+            wrapper = str(fallback)
+        if wrapper is None:
+            # Keep imports and --help usable. Execution reports how to install
+            # or explicitly configure the missing wrapper.
+            wrapper = _CLAUDE_TMUX_EXECUTABLE
+
+    flags = [flag for flag in shlex.split(extra_flags) if flag != "--yolo"]
+    return shlex.join([wrapper, *flags])
 
 
 def extract_usage_metadata(stdout="", stderr="", *, provider=None):
@@ -907,7 +941,8 @@ def run_cmd(
 
 
 __all__ = [
-    "DEFAULT_PROVIDER_CONFIG_PATH", "PROVIDER_CONFIG_ENV", "ProviderConfig",
+    "CLAUDE_TMUX_PATH_ENV", "DEFAULT_PROVIDER_CONFIG_PATH",
+    "PROVIDER_CONFIG_ENV", "ProviderConfig",
     "ProviderConfigError", "ProviderEntry", "ProviderRegistry",
     "classify_transient_error", "default_wrapper_cmd", "detect_provider",
     "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",

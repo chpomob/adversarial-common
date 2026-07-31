@@ -787,7 +787,9 @@ def run_cli(
         raise TypeError("attempt_log must support append")
 
     if persona_file:
-        argv, stdin_text = providers.inject_persona(argv, persona_file, stdin_text)
+        argv, stdin_text = providers.inject_persona(
+            argv, persona_file, stdin_text, delimiter=True
+        )
 
     if input_limit is not None and stdin_text is not None:
         capped_input, input_truncated = gates.enforce_input_cap(stdin_text, input_limit)
@@ -1255,8 +1257,18 @@ def _execute_attempt(argv, stdin_text, timeout, cwd):
                 cwd=cwd,
                 start_new_session=True,
             )
-        except FileNotFoundError as exc:
-            return "", f"Command not found: {exc}", 127, False, False
+        except FileNotFoundError:
+            missing_command = str(argv[0])
+            if providers.detect_provider(argv) == "claude-tmux":
+                diagnostic = (
+                    "Claude wrapper command not found: "
+                    f"{shlex.quote(missing_command)}. Set "
+                    f"{providers.CLAUDE_TMUX_PATH_ENV} to the wrapper path "
+                    f"or install {missing_command} on PATH."
+                )
+            else:
+                diagnostic = f"Command not found: {shlex.quote(missing_command)}"
+            return "", diagnostic, 127, False, False
         except OSError as exc:
             return "", f"OS error: {exc}", -1, False, False
         try:
