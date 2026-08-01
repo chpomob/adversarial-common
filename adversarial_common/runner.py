@@ -883,11 +883,6 @@ def run_cli(
     if attempt_log is not None and not hasattr(attempt_log, "append"):
         raise TypeError("attempt_log must support append")
 
-    if persona_file:
-        argv, stdin_text = providers.inject_persona(
-            argv, persona_file, stdin_text, delimiter=True
-        )
-
     if input_limit is not None and stdin_text is not None:
         capped_input, input_truncated = gates.enforce_input_cap(stdin_text, input_limit)
         if input_truncated:
@@ -909,6 +904,11 @@ def run_cli(
                     metadata,
                 )
             stdin_text = capped_input
+
+    if persona_file:
+        argv, stdin_text = providers.inject_persona(
+            argv, persona_file, stdin_text, delimiter=True
+        )
 
     if ledger is not None and not callable(getattr(ledger, "record", None)):
         raise TypeError("ledger must provide record()")

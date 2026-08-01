@@ -695,8 +695,29 @@ def inject_persona(argv, persona_file, stdin_text, delimiter=False):
     return argv, stdin_text
 
 
+# ponytail: a zero-width break inserted into the middle of each sentinel literal
+# so a forged copy embedded in untrusted body no longer matches the real marker
+# exactly when the stream is re-split on the sentinels. Invisible to readers,
+# breaks the substring. Ceiling: a model/consumer that strips U+200B before
+# matching could re-forge; upgrade to a signed/hashed fence if that surfaces.
+_FORGED_MARKER_BREAK: Final = "\u200b"
+
+
+def _neutralize_forged_markers(body):
+    """Break any literal sentinel copied into untrusted body so it can't forge a
+    trusted boundary. The real markers added by _delimit_untrusted_body are never
+    passed through here, so they stay exact."""
+    for marker in (_TRUSTED_PERSONA_END, _UNTRUSTED_BODY_BEGIN, _UNTRUSTED_BODY_END):
+        if marker in body:
+            mid = len(marker) // 2
+            body = body.replace(
+                marker, marker[:mid] + _FORGED_MARKER_BREAK + marker[mid:]
+            )
+    return body
+
+
 def _delimit_untrusted_body(stdin_text):
-    body = stdin_text or ""
+    body = _neutralize_forged_markers(stdin_text or "")
     return f"{_UNTRUSTED_BODY_BEGIN}\n{body}\n{_UNTRUSTED_BODY_END}"
 
 

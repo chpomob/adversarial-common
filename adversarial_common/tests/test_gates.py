@@ -24,6 +24,11 @@ from adversarial_common import (
     pre_build_gate,
 )
 from adversarial_common.gates import TRUNCATION_MARKER
+from adversarial_common.providers import (
+    _UNTRUSTED_BODY_BEGIN,
+    _UNTRUSTED_BODY_END,
+    _delimit_untrusted_body,
+)
 
 
 def test_empty_input_is_blocked_with_named_reason():
@@ -95,6 +100,16 @@ def test_cap_leaves_text_at_limit_unchanged(cap):
 
 def test_zero_cap_is_safe_and_reported():
     assert enforce_input_cap("content", 0) == ("", True)
+
+
+@pytest.mark.parametrize("body_len, cap", [(60, 60), (100, 60)])
+def test_enforce_input_cap_then_delimit_keeps_closing_fence(body_len, cap):
+    # Cap is applied to the raw body BEFORE delimiting, so the closing fence
+    # added by delimiting always survives as the last bytes regardless of cap.
+    capped, _ = enforce_input_cap("x" * body_len, cap)
+    delimited = _delimit_untrusted_body(capped)
+    assert delimited.startswith(_UNTRUSTED_BODY_BEGIN)
+    assert delimited.endswith(_UNTRUSTED_BODY_END)
 
 
 def test_complexity_tiers_and_agent_counts_are_strictly_increasing():
