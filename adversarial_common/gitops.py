@@ -154,17 +154,61 @@ def is_dirty(workdir):
     return bool(out.strip())
 
 
-def stash_dirty(workdir):
+def stash_dirty(workdir, *, on_pushed=None):
     """Stash any dirty changes (including untracked).
 
     Returns the stash commit SHA or ``""`` when nothing was stashed. The SHA
     remains bound to this stash even if later stash operations change the
     position of ``stash@{0}``.
+
+    After a successful ``git stash push -u`` the new stash is deterministically
+    ``stash@{0}`` — nothing between the push and this return creates another
+    stash — so the id is always recoverable. The SHA is resolved, then, on
+    failure, recovered from the stash reflog head, and finally, if every
+    post-push resolution command fails or is interrupted, the literal
+    ``stash@{0}`` reflog selector is returned (which :func:`unstash`
+    re-resolves at restore time). A caller that records the id only from this
+    return value therefore never orphans a stash it cannot later pop, even
+    when capture is interrupted mid-resolution.
+
+    *on_pushed*, if given, is invoked with the deterministic ``stash@{0}``
+    selector the instant ``git stash push -u`` succeeds and BEFORE any
+    resolution attempt. A caller that records this into its run state is
+    protected against an interruption (e.g. ``KeyboardInterrupt`` — a
+    ``BaseException`` that the resolution guards below do not catch) during
+    the subsequent SHA lookup: even if ``stash_dirty`` itself raises before
+    returning, the state already holds a recoverable id that :func:`unstash`
+    re-resolves at restore time, so the user's stashed work is never orphaned.
     """
     if not is_dirty(workdir):
         return ""
     _git(workdir, ["stash", "push", "-u"])
-    return _git(workdir, ["rev-parse", "--verify", "stash@{0}"]).strip()
+    if on_pushed is not None:
+        # Record the deterministic id BEFORE resolution, so an interruption
+        # (KeyboardInterrupt / any BaseException the guards below don't catch)
+        # during the SHA lookup still leaves the caller's state holding a
+        # recoverable stash selector instead of an empty id.
+        on_pushed("stash@{0}")
+    try:
+        sha = _git(workdir, ["rev-parse", "--verify", "stash@{0}"]).strip()
+        if sha:
+            return sha
+    except (GitError, subprocess.TimeoutExpired):
+        pass
+    try:
+        # ponytail: rev-parse failed after the push succeeded; recover the
+        # SHA from the stash reflog head instead of orphaning the stash.
+        entries = _git(workdir, ["stash", "list", "--format=%H"]).splitlines()
+        if entries:
+            return entries[0].strip()
+    except (GitError, subprocess.TimeoutExpired):
+        pass
+    # ponytail: every post-push resolution failed, but the just-pushed stash
+    # IS stash@{0} (nothing shifted the reflog between the push and here).
+    # Return the reflog selector so unstash re-resolves it at restore time
+    # instead of raising with an empty id and orphaning the user's work. Worst
+    # case restore_git reports this id to the user for manual recovery.
+    return "stash@{0}"
 
 
 def unstash(workdir, stash_ref):

@@ -160,6 +160,120 @@ class TestGitOps:
         )
         assert remaining_shas.splitlines() == [newer_sha]
 
+    # --- stash capture robustness (A2) -------------------------------------
+
+    def test_stash_dirty_recovers_sha_when_rev_parse_fails(self):
+        # `git stash push -u` can succeed while the follow-up `stash@{0}`
+        # resolution fails (git error / timeout). stash_dirty must still return
+        # the new stash's SHA recovered from the reflog head, so a caller that
+        # records the id only on return never orphans a stash it cannot pop.
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        _write(self.tmpdir, "f.txt", "v2")
+
+        orig_git = gitops._git
+
+        def flaky_git(workdir, args):
+            if args[:3] == ["rev-parse", "--verify", "stash@{0}"]:
+                raise gitops.GitError("simulated rev-parse failure")
+            return orig_git(workdir, args)
+
+        gitops._git = flaky_git
+        try:
+            ref = gitops.stash_dirty(self.tmpdir)
+        finally:
+            gitops._git = orig_git
+
+        assert ref  # not empty — the stash id was recovered, not orphaned
+        stash_shas, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert stash_shas.splitlines() == [ref]
+        # and the recovered id still pops by identity, restoring the work
+        gitops.unstash(self.tmpdir, ref)
+        assert _read(self.tmpdir, "f.txt") == "v2"
+        remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert remaining.strip() == ""
+
+    def test_stash_dirty_never_orphans_when_all_resolution_fails(self):
+        # A2 broad claim: `git stash push -u` can succeed while EVERY follow-up
+        # resolution command fails (rev-parse AND the reflog-list recovery).
+        # stash_dirty must still return a non-empty, recoverable id instead of
+        # raising with state["stash_id"] empty and orphaning the user's work.
+        # The just-pushed stash is deterministically stash@{0}, so the literal
+        # selector is returned and unstash re-resolves it (git healthy by then).
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        _write(self.tmpdir, "f.txt", "v2")
+
+        orig_git = gitops._git
+
+        def total_git(workdir, args):
+            if args[:3] == ["rev-parse", "--verify", "stash@{0}"]:
+                raise gitops.GitError("simulated rev-parse failure")
+            if args[:2] == ["stash", "list"]:
+                raise gitops.GitError("simulated reflog-list failure")
+            return orig_git(workdir, args)
+
+        gitops._git = total_git
+        try:
+            ref = gitops.stash_dirty(self.tmpdir)
+        finally:
+            gitops._git = orig_git
+
+        # The literal selector is the deterministic, recoverable fallback.
+        assert ref == "stash@{0}"
+        # The stash exists on disk (push succeeded) and the id still pops,
+        # restoring the user's work end-to-end.
+        stash_list, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert stash_list.strip() != ""
+        gitops.unstash(self.tmpdir, ref)
+        assert _read(self.tmpdir, "f.txt") == "v2"
+        remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert remaining.strip() == ""
+
+    def test_stash_dirty_records_id_before_resolution_can_be_interrupted(self):
+        # A2 residual gap the GitError-only tests could not prove: a
+        # BaseException (e.g. KeyboardInterrupt) raised during the post-push
+        # SHA resolution propagates before stash_dirty returns, so a caller
+        # that records the id only from the return value would orphan the
+        # stash. on_pushed fires the instant `git stash push -u` succeeds and
+        # BEFORE any resolution, so the caller's state is populated with a
+        # recoverable id even when stash_dirty itself raises mid-resolution.
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        _write(self.tmpdir, "f.txt", "v2")
+
+        recorded = {}
+
+        def recorder(stash_id):
+            recorded["stash_id"] = stash_id
+
+        orig_git = gitops._git
+
+        def interrupting_git(workdir, args):
+            if args[:3] == ["rev-parse", "--verify", "stash@{0}"]:
+                raise KeyboardInterrupt("simulated Ctrl-C during capture")
+            return orig_git(workdir, args)
+
+        gitops._git = interrupting_git
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                gitops.stash_dirty(self.tmpdir, on_pushed=recorder)
+        finally:
+            gitops._git = orig_git
+
+        # The id was recorded before the interruption: state is recoverable
+        # even though stash_dirty raised without returning.
+        assert recorded["stash_id"] == "stash@{0}"
+        # The stash exists on disk (push succeeded) and the recorded selector
+        # pops by identity, restoring the user's work end-to-end.
+        gitops.unstash(self.tmpdir, recorded["stash_id"])
+        assert _read(self.tmpdir, "f.txt") == "v2"
+        remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert remaining.strip() == ""
+
     # --- branch management --------------------------------------------------
 
     def test_create_loop_branch(self):

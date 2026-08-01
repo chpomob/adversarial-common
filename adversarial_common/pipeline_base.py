@@ -405,7 +405,16 @@ def setup_git(
             detected_parent = "main"
         parent = selected.parent_branch or detected_parent
         target_state["parent_branch"] = parent
-        target_state["stash_id"] = adapter.stash_dirty(workdir)
+
+        def _record_stash_id(stash_id):
+            # Fires the instant `git stash push -u` succeeds (before SHA
+            # resolution), so a KeyboardInterrupt/BaseException mid-resolution
+            # still leaves state holding a recoverable id for restore_git.
+            target_state["stash_id"] = stash_id
+
+        target_state["stash_id"] = adapter.stash_dirty(
+            workdir, on_pushed=_record_stash_id,
+        )
         branch = adapter.create_loop_branch(
             workdir, feature, parent, prefix=selected.prefix,
         )

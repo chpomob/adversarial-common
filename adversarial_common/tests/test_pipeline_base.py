@@ -48,8 +48,10 @@ class FakeGit:
         self.repo = True
         self.branch = "main"
 
-    def stash_dirty(self, workdir):
+    def stash_dirty(self, workdir, *, on_pushed=None):
         self._call("stash", workdir)
+        if self.stash and on_pushed is not None:
+            on_pushed("stash@{0}")
         return self.stash
 
     def create_loop_branch(self, workdir, feature, parent, prefix="loop"):
