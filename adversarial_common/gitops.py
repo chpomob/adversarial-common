@@ -416,6 +416,15 @@ def remove_worktree(repo, path):
     # Exit 0 on success; non-zero when already gone — ignore both.
 
 
+def prune_worktrees(repo):
+    """Prune stale worktree metadata in *repo* (``git worktree prune``).
+
+    Reconciles ``.git/worktrees/<id>`` entries whose working directories no
+    longer exist. Idempotent and safe to call when nothing is stale.
+    """
+    _git(repo, ["worktree", "prune"])
+
+
 def cherry_pick(workdir, commit_ref):
     """Cherry-pick *commit_ref* into the current branch in *workdir*.
 

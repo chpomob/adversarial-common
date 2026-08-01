@@ -291,6 +291,24 @@ class TestGitOps:
             content = fh.read()
         assert "*.log" in content.splitlines()
 
+    def test_prune_worktrees_runs_git_worktree_prune(self):
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+
+        wt_path = os.path.join(self.tmpdir, "wt")
+        gitops.create_worktree(self.tmpdir, wt_path, "HEAD")
+        wt_list, _, _ = _git(self.tmpdir, "worktree", "list")
+        assert wt_path in wt_list
+
+        # Simulate a stale metadata entry: remove the working dir but leave
+        # .git/worktrees/<id> behind.
+        shutil.rmtree(wt_path)
+        gitops.prune_worktrees(self.tmpdir)
+
+        wt_list_after, _, _ = _git(self.tmpdir, "worktree", "list")
+        assert wt_path not in wt_list_after
+
     def test_ensure_gitignore_already_present(self):
         gitops.ensure_gitignore(self.tmpdir, "*.log")
         gitops.ensure_gitignore(self.tmpdir, "*.log")
