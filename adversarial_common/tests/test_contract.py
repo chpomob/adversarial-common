@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,7 @@ from adversarial_common import (
     providers,
     runner,
 )
+from adversarial_common.contract import run_directive
 
 
 # -- R1: Threshold / env precedence ------------------------------------------
@@ -732,3 +735,255 @@ def test_directive_location_binding():
     assert not res.ok
     assert any("misplaced" in e.cause for e in res.errors)
     assert res.directives == []
+
+
+# -- P3: execution engine (adversarial_common.contract.run_directive) ---------
+#
+# AC1 test_execution_semantics: the fixed execution contract for one parsed
+# directive — cwd is repo_root, fixed documented env (no ambient leak, no
+# operator rc), per-directive timeout fails instead of hanging, output is
+# length-bounded with a marker, a signal-terminated child is a recorded
+# interruption (never pass), no-diff compares only the named set and ignores
+# untracked noise, and grep present/absent pass/fail is correct.
+
+
+def _git_init_repo(path):
+    """Init a throwaway git repo at *path* with one committed tracked file."""
+    env = {
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.co",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.co",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True, env={**os.environ, **env})
+    (path / "tracked.txt").write_text("foo line\n")
+    subprocess.run(["git", "add", "-A"], cwd=path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=path, check=True, env={**os.environ, **env})
+
+
+def _directive(kind, command, **kwargs):
+    """Build a Directive bound to AC1 with sensible parser-equivalent defaults."""
+    return _contract.Directive(ac="AC1", kind=kind, command=command.encode(), **kwargs)
+
+
+def _assert_result_shape(result):
+    assert set(result) == {
+        "id", "status", "command", "timed_out", "message", "truncated_output",
+    }
+    assert result["status"] in ("pass", "fail")
+    assert isinstance(result["timed_out"], bool)
+    assert result["id"].startswith("AC1:")
+
+
+def test_execution_semantics(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    rr = str(repo)
+
+    # --- shell: writes a file under the fixed env, cwd is repo_root ----------
+    out = run_directive(_directive("shell", "echo hello > out.txt"), rr)
+    _assert_result_shape(out)
+    assert out["status"] == "pass", out
+    assert out["id"] == "AC1:shell"
+    assert (repo / "out.txt").read_text().strip() == "hello"  # cwd was repo_root
+
+    # fixed env: an ambient var never reaches the child (no leak), and PATH is
+    # the engine's explicit constant, not the operator's.
+    monkeypatch.setenv("AC_AMBIENT_LEAK", "secret")
+    no_leak = run_directive(_directive("shell", 'test -z "$AC_AMBIENT_LEAK"'), rr)
+    assert no_leak["status"] == "pass", no_leak
+    fixed_path = run_directive(
+        _directive("shell", 'test "$PATH" = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"'),
+        rr,
+    )
+    assert fixed_path["status"] == "pass", fixed_path
+
+    # --- timeout: fails fast (never pass, never hang) -----------------------
+    start = time.monotonic()
+    timed = run_directive(_directive("shell", "sleep 30", timeout=1), rr)
+    elapsed = time.monotonic() - start
+    assert timed["status"] == "fail", timed
+    assert timed["timed_out"] is True
+    assert "timeout" in timed["message"]
+    assert elapsed < 3, f"timeout did not fire fast enough: {elapsed:.1f}s"
+
+    # --- output past the limit is truncated with the shared marker ----------
+    big = run_directive(
+        _directive("shell", "awk 'BEGIN{for(i=0;i<20000;i++)printf \"x\"}'"), rr,
+    )
+    assert len(big["truncated_output"]) <= _contract.MAX_DIRECTIVE_OUTPUT
+    assert gates.TRUNCATION_MARKER in big["truncated_output"]
+
+    # --- shell exit-code contract: default 0, non-default expected matches --
+    assert run_directive(_directive("shell", "exit 0"), rr)["status"] == "pass"
+    assert run_directive(_directive("shell", "exit 1"), rr)["status"] == "fail"
+    assert run_directive(_directive("shell", "exit 3", expected=3), rr)["status"] == "pass"
+    assert run_directive(_directive("shell", "exit 4", expected=3), rr)["status"] == "fail"
+
+    # --- SIGINT/SIGTERM: status fail, interruption recorded -----------------
+    for sig_cmd, name in (("kill -TERM $$", "SIGTERM"), ("kill -INT $$", "SIGINT")):
+        sig = run_directive(_directive("shell", sig_cmd), rr)
+        assert sig["status"] == "fail", (name, sig)
+        assert sig["timed_out"] is False
+        assert "interrupted" in sig["message"], (name, sig)
+        assert name in sig["message"], (name, sig)
+
+    # --- grep: present passes, absent fails --------------------------------
+    present = run_directive(_directive("grep", "grep foo tracked.txt"), rr)
+    _assert_result_shape(present)
+    assert present["status"] == "pass", present
+    assert present["id"] == "AC1:grep"
+    absent = run_directive(_directive("grep", "grep not-present tracked.txt"), rr)
+    assert absent["status"] == "fail", absent
+    assert absent["message"] == "absent"
+
+    # --- no-diff: post-baseline mutation in the named set is flagged --------
+    # (pre-existing untracked noise outside the named set is ignored)
+    (repo / "noise.txt").write_text("pre-existing untracked noise\n")  # before run
+
+    clean = run_directive(_directive("no-diff", "true"), rr)
+    _assert_result_shape(clean)
+    assert clean["status"] == "pass", clean          # noise ignored
+    assert clean["id"] == "AC1:no-diff"
+
+    mutated = run_directive(_directive("no-diff", "echo appended >> tracked.txt"), rr)
+    assert mutated["status"] == "fail", mutated      # tracked mutation flagged
+    assert "diff" in mutated["message"]
+    assert "tracked.txt" in mutated["message"]
+    # the untracked noise is still not part of the reported diff
+    assert "noise.txt" not in mutated["message"]
+
+
+def test_grep_named_file_set_scopes_the_search(tmp_path):
+    """A2: directive.files scopes the grep, defaulting to all tracked files.
+
+    A match that lives only in an excluded file must NOT satisfy a directive
+    whose named set omits it; the default set (all tracked) does see it.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)  # tracked.txt has a single 'foo line'
+    (repo / "other.txt").write_text("uniquetoken\n")
+    subprocess.run(["git", "add", "other.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "other"],
+        cwd=repo, check=True, env={**os.environ, "GIT_AUTHOR_NAME": "t",
+                                   "GIT_AUTHOR_EMAIL": "t@t.co",
+                                   "GIT_COMMITTER_NAME": "t",
+                                   "GIT_COMMITTER_EMAIL": "t@t.co"},
+    )
+    rr = str(repo)
+
+    # named set excludes the file holding the token -> absent (fail)
+    scoped = run_directive(_directive("grep", "grep uniquetoken", files=("tracked.txt",)), rr)
+    assert scoped["status"] == "fail", scoped
+    assert scoped["message"] == "absent"
+
+    # default set (all tracked) -> present (pass)
+    default = run_directive(_directive("grep", "grep uniquetoken"), rr)
+    assert default["status"] == "pass", default
+    assert default["message"] == "present"
+
+
+def test_grep_int_expected_reads_count_mode(tmp_path):
+    """A5: an integer expectation is a match count.
+
+    Default grep prints one line per match (count = match lines); ``grep -c``
+    /``--count`` print one count per file, so the count is read off the output.
+    Truncation never miscounts the default-mode tally.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    (repo / "two.txt").write_text("foo\nfoo\n")
+    subprocess.run(["git", "add", "two.txt"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "two"],
+        cwd=repo, check=True, env={**os.environ, "GIT_AUTHOR_NAME": "t",
+                                   "GIT_AUTHOR_EMAIL": "t@t.co",
+                                   "GIT_COMMITTER_NAME": "t",
+                                   "GIT_COMMITTER_EMAIL": "t@t.co"},
+    )
+    rr = str(repo)
+    d = _directive
+
+    # default mode: 2 match lines
+    assert run_directive(d("grep", "grep foo", expected=2, files=("two.txt",)), rr)["status"] == "pass"
+    assert run_directive(d("grep", "grep foo", expected=1, files=("two.txt",)), rr)["status"] == "fail"
+
+    # count mode: grep -c / --count print the count, not match lines
+    assert run_directive(d("grep", "grep -c foo", expected=2, files=("two.txt",)), rr)["status"] == "pass"
+    assert run_directive(d("grep", "grep --count foo", expected=2, files=("two.txt",)), rr)["status"] == "pass"
+    assert run_directive(d("grep", "grep -c foo", expected=1, files=("two.txt",)), rr)["status"] == "fail"
+    # short-flag group containing c (e.g. -cn) is also count mode
+    assert run_directive(d("grep", "grep -cn foo", expected=2, files=("two.txt",)), rr)["status"] == "pass"
+
+    # count reported on failure shows the value, not just 'present'
+    miss = run_directive(d("grep", "grep -c foo", expected=9, files=("two.txt",)), rr)
+    assert miss["status"] == "fail"
+    assert miss["message"] == "count 2", miss
+
+
+def test_grep_named_set_replaces_baked_in_file_operand(tmp_path):
+    """A2 (round 3): the named set REPLACES file operands, it does not union them.
+
+    Reproduces the disputed finding: ``grep TOKEN excluded.md`` with ``files``
+    naming a different set must NOT search the excluded file baked into the
+    command. The operand is dropped, so a token living only in that excluded
+    file is absent (fail); the default set (all tracked) still sees it (pass).
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)  # tracked.txt, no token
+    (repo / "included.txt").write_text("nothing relevant here\n")
+    (repo / "excluded.md").write_text("Literal hardware mis-priming\n")
+    _env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.co",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.co"}
+    subprocess.run(["git", "add", "included.txt", "excluded.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "two"], cwd=repo, check=True, env=_env)
+    rr = str(repo)
+
+    # named set excludes the file the command bakes in -> token absent (fail)
+    scoped = run_directive(
+        _directive("grep", 'grep "Literal hardware mis-priming" excluded.md',
+                   files=("included.txt",)),
+        rr,
+    )
+    assert scoped["status"] == "fail", scoped
+    assert scoped["message"] == "absent", scoped
+
+    # default set (all tracked) searches excluded.md too -> present (pass)
+    default = run_directive(
+        _directive("grep", 'grep "Literal hardware mis-priming"'), rr,
+    )
+    assert default["status"] == "pass", default
+
+
+def test_grep_count_no_double_count_with_baked_operand(tmp_path):
+    """A5 (round 3): ``-c`` counts a baked-in file operand once, not twice.
+
+    Reproduces the disputed finding: ``grep -c PATTERN file`` under the default
+    named set (all tracked) must count *file* once. The previous append-only
+    behavior searched it twice and reported ``count 2`` for one match.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)  # tracked.txt, no match
+    (repo / "src.py").write_text("def _legal_expected():\n    pass\n")
+    _env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.co",
+            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.co"}
+    subprocess.run(["git", "add", "src.py"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "src"], cwd=repo, check=True, env=_env)
+    rr = str(repo)
+
+    ok = run_directive(
+        _directive("grep", 'grep -c "def _legal_expected" src.py', expected=1), rr,
+    )
+    assert ok["status"] == "pass", ok
+    assert ok["message"] == "count 1", ok  # counted once across all tracked
+
+    bad = run_directive(
+        _directive("grep", 'grep -c "def _legal_expected" src.py', expected=2), rr,
+    )
+    assert bad["status"] == "fail", bad
+    assert bad["message"] == "count 1", bad  # not "count 2"
+
