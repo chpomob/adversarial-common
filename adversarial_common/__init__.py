@@ -40,6 +40,7 @@ from .providers import (
     ProviderConfigError,
     ProviderEntry,
     ProviderRegistry,
+    SandboxMode,
     classify_transient_error,
     default_wrapper_cmd,
     detect_provider,
@@ -51,6 +52,7 @@ from .providers import (
     persona_for_role,
     resolve_provider_config_path,
     resolve_role_cmd,
+    resolve_sandbox_mode,
     run_cmd,
 )
 from .pipeline_base import (
@@ -155,11 +157,12 @@ __all__ = [
     "strip_json_wrapper", "write_final_json",
     # providers
     "DEFAULT_PROVIDER_CONFIG_PATH", "PROVIDER_CONFIG_ENV", "ProviderConfig",
-    "ProviderConfigError", "ProviderEntry", "ProviderRegistry",
+    "ProviderConfigError", "ProviderEntry", "ProviderRegistry", "SandboxMode",
     "classify_transient_error", "default_wrapper_cmd", "detect_provider",
     "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",
     "is_transient_error", "load_provider_config", "persona_for_role",
-    "resolve_provider_config_path", "resolve_role_cmd", "run_cmd",
+    "resolve_provider_config_path", "resolve_role_cmd", "resolve_sandbox_mode",
+    "run_cmd",
     # pipeline lifecycle
     "SETTLED_STATUSES", "FinishPolicy", "GitSetupPolicy", "PreflightPolicy",
     "PreflightResult", "RestorePolicy", "RestoreResult",

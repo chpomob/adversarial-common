@@ -5,9 +5,11 @@ import json
 import math
 import os
 import re
+import secrets
 import shlex
 import shutil
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -963,6 +965,230 @@ def _usage_from_text(text):
     return found if len(found) == 2 else None
 
 
+# --- Sandbox profile -------------------------------------------------------
+
+# Privilege-granting tokens that elevate a command above read-only/no-network.
+# A review-role command carrying any of these is a full-privilege sandbox token
+# and is rejected or rewritten to the confined profile. Tight set: ``--yolo`` is
+# already stripped by default_wrapper_cmd; the rest are the well-known "skip all
+# guards" flags across the claude/codex/pi agents this module wraps. Codex's
+# full-access sandbox is matched three ways: the bypass flag, the bare mode
+# value (``--sandbox danger-full-access``), and the ``--sandbox=...`` form.
+_FULL_PRIVILEGE_TOKENS: Final = frozenset(
+    {
+        "--yolo",
+        "--dangerously-skip-permissions",
+        "--dangerously_allow_all",
+        "--allow-all",
+        "--allow-all-tools",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--full-write",
+        "--full-access",
+        "--full-privilege",
+        "--no-sandbox",
+        # Codex sandbox modes that grant full uncontained access.
+        "--sandbox=danger-full-access",
+        "danger-full-access",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxMode:
+    """Resolved containment profile for a role (data only; it does not enforce).
+
+    The review role is read-only (``allow_write`` false) and no-network. Even so,
+    ``write_roots`` records the envelope any write must stay inside (repo worktree
+    + an ephemeral scratch dir) so the same profile can be reused by a containment
+    enforcer (P4/F1b) without re-deriving it. ``source``/``events`` carry the
+    diagnostics the caller can surface (R3).
+    """
+
+    role: str
+    network: bool
+    allow_write: bool
+    write_roots: tuple[str, ...]
+    scratch_dir: str | None
+    source: str
+    safe_command: str | None
+    events: tuple[dict[str, object], ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a YAML/JSON-safe representation of this profile."""
+        return {
+            "role": self.role,
+            "network": self.network,
+            "allow_write": self.allow_write,
+            "write_roots": list(self.write_roots),
+            "scratch_dir": self.scratch_dir,
+            "source": self.source,
+            "safe_command": self.safe_command,
+            "events": [dict(event) for event in self.events],
+        }
+
+
+def _command_tokens(command):
+    """Split a command string, tolerating unbalanced quotes via a literal scan.
+
+    A malformed command must not smuggle a privilege flag past ``shlex``.
+    """
+    if not command:
+        return []
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def _token_grants_privilege(token):
+    """Whether a single command token elevates above read-only/no-network.
+
+    Matches the raw token (for ``--sandbox=danger-full-access``) and the flag
+    portion (for bare flags and the ``--sandbox danger-full-access`` value).
+    """
+    return (
+        token in _FULL_PRIVILEGE_TOKENS
+        or token.split("=", 1)[0] in _FULL_PRIVILEGE_TOKENS
+    )
+
+
+def _find_full_privilege_tokens(command):
+    """Return the ordered, de-duplicated privilege tokens in a command."""
+    found: list[str] = []
+    seen: set[str] = set()
+    for token in _command_tokens(command):
+        if _token_grants_privilege(token) and token not in seen:
+            seen.add(token)
+            found.append(token)
+    return tuple(found)
+
+
+def _strip_privilege_tokens(tokens):
+    """Drop privilege tokens, collapsing ``--sandbox <full-access>`` pairs.
+
+    Stripping only the bare value of ``--sandbox danger-full-access`` would
+    leave a dangling flag; drop the flag too when its value is full-access.
+    """
+    kept: list[str] = []
+    remaining = list(tokens)
+    index = 0
+    while index < len(remaining):
+        token = remaining[index]
+        if _token_grants_privilege(token):
+            index += 1
+            continue
+        if (
+            token == "--sandbox"
+            and index + 1 < len(remaining)
+            and _token_grants_privilege(remaining[index + 1])
+        ):
+            index += 2
+            continue
+        kept.append(token)
+        index += 1
+    return kept
+
+
+def _detect_worktree(cwd=None):
+    """Best-effort worktree root enclosing *cwd*, or None.
+
+    Read-only ``git rev-parse``; returns None when not in a repo, when git is
+    unavailable, or when gitops cannot be imported, so the confined profile
+    degrades to scratch-only rather than failing to resolve.
+    """
+    try:
+        from . import gitops
+        return gitops.detect_enclosing_repo(cwd or os.getcwd())
+    except Exception:  # ponytail: best-effort; degrade to scratch-only
+        return None
+
+
+def resolve_sandbox_mode(
+    role="review",
+    *,
+    command=None,
+    workdir=None,
+    scratch_dir=None,
+    reject=False,
+    diagnostics=None,
+):
+    """Resolve the confinement profile for ``role`` (currently only "review").
+
+    The review role is always read-only + no-network, with writes bounded to the
+    repo ``workdir`` and an ephemeral ``scratch_dir``. A review-role command
+    carrying a full-privilege sandbox token is, by default, *rewritten* to that
+    confined profile (the token stripped) and recorded; with ``reject=True`` it
+    raises ``ProviderConfigError`` instead so the command is never run as-is.
+
+    Resolved mode and any rewrite/denial events are appended to the optional
+    ``diagnostics`` dict under ``sandbox_events`` so a caller can surface them.
+    The scratch dir is recorded as an intended path but never created here — the
+    profile is data; the containment enforcer (P4) materializes it. Unknown roles
+    raise rather than fall back to a full-privilege default.
+    """
+    role_name = _role_name(role)
+    if role_name != "review":
+        raise ProviderConfigError(
+            "SANDBOX_UNKNOWN_ROLE",
+            f"no sandbox profile registered for role '{role_name}'",
+        )
+
+    if scratch_dir:
+        resolved_scratch = str(Path(scratch_dir).expanduser())
+    else:
+        # Ephemeral per run so concurrent reviews don't collide on one fixed
+        # path. Not created here — the containment enforcer materializes it.
+        resolved_scratch = os.path.join(
+            tempfile.gettempdir(),
+            f"adversarial-{role_name}-scratch-{secrets.token_hex(4)}",
+        )
+    worktree_root = str(Path(workdir).expanduser()) if workdir else _detect_worktree()
+    write_roots: list[str] = []
+    if worktree_root:
+        write_roots.append(worktree_root)
+    write_roots.append(resolved_scratch)
+
+    events: list[dict[str, object]] = []
+    safe_command = command.strip() if isinstance(command, str) else None
+    source = "default"
+
+    tokens = _find_full_privilege_tokens(command)
+    if tokens:
+        event = {
+            "event": "full_privilege_token",
+            "role": role_name,
+            "tokens": list(tokens),
+            "action": "reject" if reject else "rewrite",
+        }
+        events.append(event)
+        if diagnostics is not None:
+            diagnostics.setdefault("sandbox_events", []).append(event)
+        if reject:
+            raise ProviderConfigError(
+                "SANDBOX_FULL_PRIVILEGE_REJECTED",
+                f"review role forbids full-privilege token(s): {', '.join(tokens)}",
+            )
+        source = "rewritten"
+        kept = _strip_privilege_tokens(_command_tokens(command))
+        safe_command = shlex.join(kept).strip() or None
+
+    mode = SandboxMode(
+        role=role_name,
+        network=False,
+        allow_write=False,
+        write_roots=tuple(write_roots),
+        scratch_dir=resolved_scratch,
+        source=source,
+        safe_command=safe_command,
+        events=tuple(events),
+    )
+    if diagnostics is not None:
+        diagnostics.setdefault("sandbox_events", []).append(
+            {"event": "resolved", "mode": mode.to_dict()}
+        )
+    return mode
+
+
 def run_cmd(
     cmd,
     stdin_text=None,
@@ -998,9 +1224,10 @@ def run_cmd(
 __all__ = [
     "CLAUDE_TMUX_PATH_ENV", "DEFAULT_PROVIDER_CONFIG_PATH",
     "PROVIDER_CONFIG_ENV", "ProviderConfig",
-    "ProviderConfigError", "ProviderEntry", "ProviderRegistry",
+    "ProviderConfigError", "ProviderEntry", "ProviderRegistry", "SandboxMode",
     "classify_transient_error", "default_wrapper_cmd", "detect_provider",
     "enhance_cmd_for_project", "extract_usage_metadata", "inject_persona",
     "is_transient_error", "load_provider_config", "persona_for_role",
-    "resolve_provider_config_path", "resolve_role_cmd", "run_cmd",
+    "resolve_provider_config_path", "resolve_role_cmd", "resolve_sandbox_mode",
+    "run_cmd",
 ]

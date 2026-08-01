@@ -12,6 +12,7 @@ from adversarial_common.providers import (
     ProviderConfig,
     ProviderConfigError,
     ProviderEntry,
+    SandboxMode,
     classify_transient_error,
     default_wrapper_cmd,
     extract_usage_metadata,
@@ -20,6 +21,7 @@ from adversarial_common.providers import (
     load_provider_config,
     resolve_provider_config_path,
     resolve_role_cmd,
+    resolve_sandbox_mode,
 )
 
 
@@ -517,3 +519,143 @@ def test_usage_text_fallback_requires_a_complete_pair():
         "input_tokens=13 output_tokens=5", provider="codex"
     ) == {"prompt_tokens": 13, "completion_tokens": 5}
     assert extract_usage_metadata("input_tokens=13", provider="codex") is None
+
+
+def test_review_role_resolves_read_only_no_network():
+    mode = resolve_sandbox_mode("review", workdir="/repo", scratch_dir="/tmp/scratch")
+
+    assert mode.role == "review"
+    assert mode.network is False
+    assert mode.allow_write is False
+    # No out-of-scope write root: every root is the workdir or the scratch dir.
+    assert set(mode.write_roots) <= {"/repo", "/tmp/scratch"}
+    assert "/repo" in mode.write_roots
+    assert "/tmp/scratch" in mode.write_roots
+
+
+def test_full_write_token_rejected_for_review():
+    command = "claude --yolo --full-write /repo"
+
+    # By default the full-privilege token is rewritten, never executed as-is.
+    rewritten = resolve_sandbox_mode("review", command=command, workdir="/repo")
+    assert rewritten.source == "rewritten"
+    assert "--yolo" not in (rewritten.safe_command or "")
+    assert "--full-write" not in (rewritten.safe_command or "")
+    assert rewritten.network is False
+    assert rewritten.allow_write is False
+    assert any(
+        event["event"] == "full_privilege_token" for event in rewritten.events
+    )
+
+    # With reject=True the same token raises instead of rewriting.
+    with pytest.raises(ProviderConfigError, match="SANDBOX_FULL_PRIVILEGE_REJECTED"):
+        resolve_sandbox_mode("review", command=command, workdir="/repo", reject=True)
+
+
+def test_review_role_forbids_full_privilege_default():
+    # The default review profile (no command, no privilege tokens) is never
+    # full-privilege: read-only and no network regardless of input.
+    mode = resolve_sandbox_mode("review")
+
+    assert mode.network is False
+    assert mode.allow_write is False
+    assert mode.source == "default"
+    assert mode.events == ()
+
+
+def test_diagnostics_hook_records_resolution_and_rewrite():
+    diagnostics: dict = {}
+
+    resolve_sandbox_mode(
+        "review",
+        command="claude --yolo /repo",
+        workdir="/repo",
+        diagnostics=diagnostics,
+    )
+
+    events = diagnostics["sandbox_events"]
+    assert any(event["event"] == "full_privilege_token" for event in events)
+    resolved = next(event for event in events if event["event"] == "resolved")
+    assert resolved["mode"]["network"] is False
+    assert resolved["mode"]["allow_write"] is False
+
+
+def test_unknown_role_has_no_silent_full_privilege_default():
+    with pytest.raises(ProviderConfigError, match="SANDBOX_UNKNOWN_ROLE"):
+        resolve_sandbox_mode("builder")
+
+
+def test_sandbox_mode_round_trips_to_dict():
+    mode = resolve_sandbox_mode("review", workdir="/repo", scratch_dir="/tmp/scratch")
+
+    payload = mode.to_dict()
+    assert payload["role"] == "review"
+    assert payload["network"] is False
+    assert payload["allow_write"] is False
+    assert set(payload["write_roots"]) <= {"/repo", "/tmp/scratch"}
+    assert payload["source"] == "default"
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "codex --sandbox danger-full-access /repo",
+        "codex --sandbox=danger-full-access /repo",
+        "codex --dangerously-bypass-approvals-and-sandbox /repo",
+    ],
+)
+def test_codex_full_access_tokens_rewritten_for_review(command):
+    mode = resolve_sandbox_mode("review", command=command, workdir="/repo")
+
+    assert mode.source == "rewritten"
+    assert "danger-full-access" not in (mode.safe_command or "")
+    assert "dangerously-bypass" not in (mode.safe_command or "")
+    # The flag is collapsed away, not left dangling.
+    assert "--sandbox" not in (mode.safe_command or "")
+    assert mode.network is False and mode.allow_write is False
+    assert any(e["event"] == "full_privilege_token" for e in mode.events)
+
+
+def test_codex_full_access_token_rejected_when_requested():
+    with pytest.raises(ProviderConfigError, match="SANDBOX_FULL_PRIVILEGE_REJECTED"):
+        resolve_sandbox_mode(
+            "review",
+            command="codex --sandbox=danger-full-access /repo",
+            workdir="/repo",
+            reject=True,
+        )
+
+
+def test_safe_sandbox_mode_is_preserved():
+    # read-only sandbox modes are not privilege tokens and stay intact.
+    mode = resolve_sandbox_mode(
+        "review", command="codex --sandbox read-only /repo", workdir="/repo"
+    )
+    assert mode.source == "default"
+    assert "--sandbox read-only" in (mode.safe_command or "")
+
+
+def test_default_review_detects_worktree_and_ephemeral_scratch(monkeypatch):
+    repo_root = Path(__file__).resolve().parents[2]
+    monkeypatch.chdir(repo_root)
+
+    mode = resolve_sandbox_mode("review")
+
+    # The worktree root is identified even when workdir is omitted.
+    assert str(repo_root) in mode.write_roots
+    assert mode.scratch_dir in mode.write_roots
+    # Scratch is ephemeral: each run yields a distinct path.
+    other = resolve_sandbox_mode("review")
+    assert mode.scratch_dir != other.scratch_dir
+
+
+def test_path_scratch_dir_is_json_safe():
+    mode = resolve_sandbox_mode(
+        "review", workdir="/repo", scratch_dir=Path("/tmp/scratch")
+    )
+
+    assert mode.scratch_dir == "/tmp/scratch"
+    assert isinstance(mode.scratch_dir, str)
+    assert all(isinstance(root, str) for root in mode.write_roots)
+    # to_dict() must stay JSON-serializable (the A3 regression).
+    json.dumps(mode.to_dict())
