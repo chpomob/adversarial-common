@@ -125,7 +125,12 @@ def _process_group_is_active(process: subprocess.Popen) -> bool:
         return False
     try:
         os.killpg(process.pid, 0)
-    except (AttributeError, ProcessLookupError, OSError):
+    except ProcessLookupError:
+        # Group leader is definitively gone; stop waiting on it.
+        return False
+    except (AttributeError, OSError):
+        # Liveness undeterminable (e.g. killpg unavailable): keep waiting
+        # rather than risk skipping cleanup of a still-live group.
         return True
     return True
 
@@ -137,6 +142,8 @@ def terminate_active_processes() -> None:
     cleanup concurrently.  Processes that exit during cleanup are harmless,
     and a subsequent call is a no-op once the registry is empty.
     """
+    # Hold across the sweep so concurrent Popen spawns cannot reuse a PID we
+    # are about to signal (would kill an unrelated freshly-spawned process).
     with _TERMINATE_ACTIVE_LOCK:
         with _ACTIVE_PROCESSES_LOCK:
             processes = tuple(_ACTIVE_PROCESSES)
@@ -1348,6 +1355,8 @@ def _execute_attempt(argv, stdin_text, timeout, cwd):
         # Hold the cleanup lock across creation and registration.  Cleanup
         # therefore observes either no child yet or a fully registered one,
         # never a live process in the gap between those two operations.
+        # Serializing with the sweep also prevents a reused PID from being
+        # signaled while this spawn is in flight.
         with _TERMINATE_ACTIVE_LOCK:
             try:
                 proc = subprocess.Popen(
@@ -1405,6 +1414,8 @@ def _execute_attempt(argv, stdin_text, timeout, cwd):
         # while communicate() is unwinding.  Clean up the local process even
         # if it is no longer visible in the global registry.
         if proc is not None:
+            # Same pid-reuse rationale as the global sweep: serialize the
+            # local cleanup with concurrent spawns.
             with _TERMINATE_ACTIVE_LOCK:
                 _terminate_processes((proc,))
             _unregister_process(proc)

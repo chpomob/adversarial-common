@@ -395,6 +395,7 @@ def test_started_process_is_cleaned_up_when_communicate_is_interrupted(
 
     monkeypatch.setattr(runner.subprocess, "Popen", lambda *args, **kwargs: process)
     monkeypatch.setattr(runner, "_signal_process_group", signal_process_group)
+    monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: None)
     monkeypatch.setattr(runner, "_TERMINATION_GRACE_SECONDS", 0)
 
     try:
@@ -425,6 +426,36 @@ def test_reaped_process_group_is_not_probed(monkeypatch):
 
     assert not runner._process_group_is_active(ReapedProcess())
     assert probes == []
+
+
+def test_process_group_is_active_returns_false_on_process_lookup_error(monkeypatch):
+    class LiveProcess:
+        pid = 4321
+
+        def poll(self):
+            return None
+
+    def raise_lookup_error(pid, sig):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(runner.os, "killpg", raise_lookup_error)
+
+    assert runner._process_group_is_active(LiveProcess()) is False
+
+
+def test_process_group_is_active_returns_true_on_other_oserror(monkeypatch):
+    class LiveProcess:
+        pid = 4322
+
+        def poll(self):
+            return None
+
+    def raise_oserror(pid, sig):
+        raise OSError()
+
+    monkeypatch.setattr(runner.os, "killpg", raise_oserror)
+
+    assert runner._process_group_is_active(LiveProcess()) is True
 
 
 def test_process_creation_and_registration_are_atomic_with_cleanup(monkeypatch):
@@ -468,6 +499,7 @@ def test_process_creation_and_registration_are_atomic_with_cleanup(monkeypatch):
 
     monkeypatch.setattr(runner.subprocess, "Popen", create_process)
     monkeypatch.setattr(runner, "_signal_process_group", signal_process_group)
+    monkeypatch.setattr(runner.os, "killpg", lambda pid, sig: None)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         attempt = pool.submit(
