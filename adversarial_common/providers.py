@@ -18,7 +18,6 @@ DEFAULT_PROVIDER_CONFIG_PATH: Final = Path("~/.config/adversarial/providers.yaml
 PROVIDER_CONFIG_ENV: Final = "ADVERSARIAL_PROVIDER_CONFIG"
 CLAUDE_TMUX_PATH_ENV: Final = "ADVERSARIAL_CLAUDE_TMUX_PATH"
 _CLAUDE_TMUX_EXECUTABLE: Final = "claude-tmux.py"
-_CLAUDE_TMUX_FALLBACK: Final = Path.home() / "claude-tmux-wrapper" / "claude-tmux.py"
 _TRUSTED_PERSONA_END: Final = "--- END TRUSTED PERSONA ---"
 _UNTRUSTED_BODY_BEGIN: Final = "--- BEGIN UNTRUSTED CONTENT ---"
 _UNTRUSTED_BODY_END: Final = "--- END UNTRUSTED CONTENT ---"
@@ -768,20 +767,36 @@ def resolve_role_cmd(
     return shlex.join(os.path.expanduser(token) for token in shlex.split(cmd))
 
 
-def default_wrapper_cmd(extra_flags=""):
-    """Return the discovered Claude wrapper command without pinning a model."""
-    override = os.environ.get(CLAUDE_TMUX_PATH_ENV, "").strip()
+def default_wrapper_cmd(extra_flags="", *, environ=None):
+    """Return the discovered Claude wrapper command without pinning a model.
+
+    ``environ`` (default ``os.environ``) drives the
+    ``$ADVERSARIAL_CLAUDE_TMUX_PATH`` override and the HOME-derived fallback
+    path so callers need not monkeypatch module state. Raises ``RuntimeError``
+    distinguishing a PATH miss from a missing fallback when nothing resolves.
+    """
+    environment = os.environ if environ is None else environ
+    override = environment.get(CLAUDE_TMUX_PATH_ENV, "").strip()
     if override:
+        # ponytail: override tilde expansion still reads the process HOME; the
+        # override path is virtually always absolute, so environ-HOME symmetry
+        # for it is YAGNI (only the fallback path needs injectable HOME).
         wrapper = os.path.expanduser(override)
     else:
         wrapper = shutil.which(_CLAUDE_TMUX_EXECUTABLE)
-        fallback = _CLAUDE_TMUX_FALLBACK.expanduser()
+        home = environment.get("HOME")
+        fallback = (
+            Path(home) if home else Path.home()
+        ) / "claude-tmux-wrapper" / _CLAUDE_TMUX_EXECUTABLE
         if wrapper is None and fallback.is_file():
             wrapper = str(fallback)
         if wrapper is None:
-            # Keep imports and --help usable. Execution reports how to install
-            # or explicitly configure the missing wrapper.
-            wrapper = _CLAUDE_TMUX_EXECUTABLE
+            raise RuntimeError(
+                f"{_CLAUDE_TMUX_EXECUTABLE} not found on PATH and fallback file "
+                f"does not exist at {fallback}; set ${CLAUDE_TMUX_PATH_ENV} or "
+                f"install the wrapper (the pre-migration hardcoded path is no "
+                f"longer checked)"
+            )
 
     flags = [flag for flag in shlex.split(extra_flags) if flag != "--yolo"]
     return shlex.join([wrapper, *flags])

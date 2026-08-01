@@ -374,29 +374,17 @@ def test_default_wrapper_uses_executable_lookup_before_real_path(
     assert shlex.split(default_wrapper_cmd()) == [str(wrapper)]
 
 
-def test_default_wrapper_uses_real_path_fallback(monkeypatch, tmp_path):
-    wrapper = tmp_path / "claude-tmux-wrapper" / "claude-tmux.py"
-    wrapper.parent.mkdir()
+def test_default_wrapper_cmd_uses_injected_environ_home(monkeypatch, tmp_path):
+    fake_home = tmp_path / "fakehome"
+    wrapper = fake_home / "claude-tmux-wrapper" / "claude-tmux.py"
+    wrapper.parent.mkdir(parents=True)
     wrapper.touch()
-    monkeypatch.delenv(providers.CLAUDE_TMUX_PATH_ENV, raising=False)
     monkeypatch.setattr(providers.shutil, "which", lambda executable: None)
-    monkeypatch.setattr(providers, "_CLAUDE_TMUX_FALLBACK", wrapper)
 
-    assert shlex.split(default_wrapper_cmd()) == [str(wrapper)]
+    command = default_wrapper_cmd(environ={"HOME": str(fake_home)})
 
-
-def test_default_wrapper_expands_home_relative_fallback(monkeypatch, tmp_path):
-    wrapper = tmp_path / "wrapper" / "claude-tmux.py"
-    wrapper.parent.mkdir()
-    wrapper.touch()
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv(providers.CLAUDE_TMUX_PATH_ENV, raising=False)
-    monkeypatch.setattr(providers.shutil, "which", lambda executable: None)
-    monkeypatch.setattr(
-        providers, "_CLAUDE_TMUX_FALLBACK", Path("~/wrapper/claude-tmux.py")
-    )
-
-    assert shlex.split(default_wrapper_cmd()) == [str(wrapper)]
+    # Resolves the injected HOME's fallback without consulting the real HOME.
+    assert shlex.split(command) == [str(wrapper)]
 
 
 def test_default_wrapper_quotes_path_with_spaces(monkeypatch, tmp_path):
@@ -411,17 +399,39 @@ def test_default_wrapper_quotes_path_with_spaces(monkeypatch, tmp_path):
     assert shlex.quote(str(wrapper)) in command
 
 
-def test_default_wrapper_gracefully_falls_back_and_removes_yolo(
+def test_default_wrapper_strips_yolo_flag(monkeypatch, tmp_path):
+    fake_home = tmp_path / "fakehome"
+    wrapper = fake_home / "claude-tmux-wrapper" / "claude-tmux.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.touch()
+    monkeypatch.setattr(providers.shutil, "which", lambda executable: None)
+
+    command = default_wrapper_cmd(
+        "--yolo --model sonnet", environ={"HOME": str(fake_home)}
+    )
+
+    assert shlex.split(command) == [str(wrapper), "--model", "sonnet"]
+    assert "--yolo" not in command
+
+
+def test_default_wrapper_cmd_error_distinguishes_path_vs_fallback(
     monkeypatch, tmp_path
 ):
-    monkeypatch.delenv(providers.CLAUDE_TMUX_PATH_ENV, raising=False)
     monkeypatch.setattr(providers.shutil, "which", lambda executable: None)
-    monkeypatch.setattr(providers, "_CLAUDE_TMUX_FALLBACK", tmp_path / "missing.py")
+    fake_home = tmp_path / "no-wrapper-here"
 
-    command = default_wrapper_cmd("--yolo --model sonnet")
+    with pytest.raises(RuntimeError) as caught:
+        default_wrapper_cmd(environ={"HOME": str(fake_home)})
 
-    assert shlex.split(command) == ["claude-tmux.py", "--model", "sonnet"]
-    assert "--yolo" not in command
+    message = str(caught.value)
+    # The two failure causes are named distinctly instead of collapsed into a
+    # single generic "wrapper missing" sentence (finding CO8):
+    assert "not found on PATH" in message
+    assert "does not exist" in message
+    expected_fallback = str(fake_home / "claude-tmux-wrapper" / "claude-tmux.py")
+    assert expected_fallback in message
+    # The legacy pre-migration hardcoded path is no longer consulted:
+    assert "no longer checked" in message
 
 
 def test_inject_persona_delimiter_is_optional(tmp_path):
