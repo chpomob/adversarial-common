@@ -221,8 +221,8 @@ class TestGitOps:
         finally:
             gitops._git = orig_git
 
-        # The literal selector is the deterministic, recoverable fallback.
-        assert ref == "stash@{0}"
+        # The push marker is the deterministic, recoverable fallback.
+        assert ref.startswith(gitops._STASH_MARKER_PREFIX)
         # The stash exists on disk (push succeeded) and the id still pops,
         # restoring the user's work end-to-end.
         stash_list, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
@@ -266,13 +266,57 @@ class TestGitOps:
 
         # The id was recorded before the interruption: state is recoverable
         # even though stash_dirty raised without returning.
-        assert recorded["stash_id"] == "stash@{0}"
+        assert recorded["stash_id"].startswith(gitops._STASH_MARKER_PREFIX)
         # The stash exists on disk (push succeeded) and the recorded selector
         # pops by identity, restoring the user's work end-to-end.
         gitops.unstash(self.tmpdir, recorded["stash_id"])
         assert _read(self.tmpdir, "f.txt") == "v2"
         remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
         assert remaining.strip() == ""
+
+    def test_stash_dirty_interrupted_marker_survives_an_intervening_stash(self):
+        # M1 AC2: the marker on_pushed records during an interrupted capture
+        # must stay resolvable even if another stash lands on top of it
+        # before restore_git eventually calls unstash — a positional
+        # "stash@{0}" guess would instead pop the newer, wrong stash.
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        _write(self.tmpdir, "f.txt", "v2-original")
+
+        recorded = {}
+
+        def recorder(stash_id):
+            recorded["stash_id"] = stash_id
+
+        orig_git = gitops._git
+
+        def interrupting_git(workdir, args):
+            if args[:3] == ["rev-parse", "--verify", "stash@{0}"]:
+                raise KeyboardInterrupt("simulated Ctrl-C during capture")
+            return orig_git(workdir, args)
+
+        gitops._git = interrupting_git
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                gitops.stash_dirty(self.tmpdir, on_pushed=recorder)
+        finally:
+            gitops._git = orig_git
+
+        # A second, unrelated stash lands on top of the interrupted one
+        # before restore ever runs, shifting stash@{0} to point elsewhere.
+        _write(self.tmpdir, "f.txt", "v3-intervening")
+        second_sha = gitops.stash_dirty(self.tmpdir)
+        stash_shas, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert len(stash_shas.splitlines()) == 2
+
+        gitops.unstash(self.tmpdir, recorded["stash_id"])
+
+        # The FIRST (interrupted) stash's content is restored, not the
+        # second's — proving the marker resolves by content, not position.
+        assert _read(self.tmpdir, "f.txt") == "v2-original"
+        remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert remaining.splitlines() == [second_sha]
 
     # --- branch management --------------------------------------------------
 

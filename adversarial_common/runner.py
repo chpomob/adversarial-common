@@ -890,9 +890,83 @@ def run_cli(
     if attempt_log is not None and not hasattr(attempt_log, "append"):
         raise TypeError("attempt_log must support append")
 
-    if input_limit is not None and stdin_text is not None:
-        capped_input, input_truncated = gates.enforce_input_cap(stdin_text, input_limit)
+    # A configured persona adds a prefix (and, for non-"claude" providers, its
+    # own text) around the body once injected below. Cap the body against the
+    # budget left over after that overhead so the final stdin — persona plus
+    # delimiters plus body — never exceeds input_limit; capping the raw body
+    # against the full limit first would let the persona push it back over.
+    effective_input_limit = input_limit
+    persona_overhead = 0
+    if persona_file and input_limit is not None:
+        _, framed_empty = providers.inject_persona(
+            argv, persona_file, "", delimiter=True
+        )
+        persona_overhead = len(framed_empty)
+        effective_input_limit = input_limit - persona_overhead
+        if effective_input_limit < 0:
+            # The persona framing alone already exceeds the hard cap, so no
+            # body length (not even an empty one) keeps the final stdin
+            # within input_limit. Clamping to 0 here would let an empty body
+            # slip through unflagged while the oversized framing is still
+            # injected and transmitted below, so refuse outright instead.
+            metadata["cap_events"].append({
+                "kind": "input",
+                "limit": input_limit,
+                "original_chars": persona_overhead,
+                "truncated": False,
+            })
+            metadata["input_rejected"] = True
+            return _result(
+                "",
+                "Persona framing alone exceeds max_input_chars "
+                f"({persona_overhead} > {input_limit})",
+                2,
+                None,
+                include_usage,
+                metadata,
+            )
+
+    if effective_input_limit is not None and stdin_text is not None:
+        capped_input, input_truncated = gates.enforce_input_cap(
+            stdin_text, effective_input_limit
+        )
         if input_truncated:
+            # Report against the total the provider would actually receive
+            # (persona framing + body), not the bare body length, since the
+            # body alone can be well within input_limit while the framed
+            # whole is what exceeds it.
+            projected_chars = len(stdin_text) + persona_overhead
+            event = {
+                "kind": "input",
+                "limit": input_limit,
+                "original_chars": projected_chars,
+                "truncated": truncate_input,
+            }
+            metadata["cap_events"].append(event)
+            if not truncate_input:
+                metadata["input_rejected"] = True
+                return _result(
+                    "",
+                    f"Input exceeds max_input_chars ({projected_chars} > {input_limit})",
+                    2,
+                    None,
+                    include_usage,
+                    metadata,
+                )
+            stdin_text = capped_input
+
+    if persona_file:
+        argv, stdin_text = providers.inject_persona(
+            argv, persona_file, stdin_text, delimiter=True
+        )
+        if (
+            input_limit is not None
+            and stdin_text is not None
+            and len(stdin_text) > input_limit
+        ):
+            # Neutralizing forged sentinel markers inside the untrusted body
+            # can insert extra characters after the budget check above, so
+            # re-verify the actual injected stdin against the hard cap.
             event = {
                 "kind": "input",
                 "limit": input_limit,
@@ -910,12 +984,7 @@ def run_cli(
                     include_usage,
                     metadata,
                 )
-            stdin_text = capped_input
-
-    if persona_file:
-        argv, stdin_text = providers.inject_persona(
-            argv, persona_file, stdin_text, delimiter=True
-        )
+            stdin_text, _ = gates.enforce_input_cap(stdin_text, input_limit)
 
     if ledger is not None and not callable(getattr(ledger, "record", None)):
         raise TypeError("ledger must provide record()")

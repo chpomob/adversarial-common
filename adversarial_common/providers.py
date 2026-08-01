@@ -767,21 +767,40 @@ def resolve_role_cmd(
     return shlex.join(os.path.expanduser(token) for token in shlex.split(cmd))
 
 
+def _expand_home_prefix(path, environment):
+    """Expand a leading ``~``/``~/`` against the injected environ HOME.
+
+    Falls back to the real HOME when the injected environment does not carry
+    one, so production behavior (no explicit ``environ=``) is unchanged.
+    """
+    if path == "~":
+        return environment.get("HOME") or os.path.expanduser("~")
+    if path.startswith("~/"):
+        home = environment.get("HOME") or os.path.expanduser("~")
+        return os.path.join(home, path[2:])
+    if path.startswith("~"):
+        # Named-user form (e.g. ``~root/bin/...``) names a home directory
+        # that isn't the injected environ's HOME, so defer to the OS/passwd
+        # lookup exactly as the previous os.path.expanduser(...) call did.
+        return os.path.expanduser(path)
+    return path
+
+
 def default_wrapper_cmd(extra_flags="", *, environ=None):
     """Return the discovered Claude wrapper command without pinning a model.
 
     ``environ`` (default ``os.environ``) drives the
     ``$ADVERSARIAL_CLAUDE_TMUX_PATH`` override and the HOME-derived fallback
-    path so callers need not monkeypatch module state. Raises ``RuntimeError``
-    distinguishing a PATH miss from a missing fallback when nothing resolves.
+    path so callers need not monkeypatch module state. Never raises: when
+    nothing resolves (nothing on PATH, no configured override, no fallback
+    file), the bare executable name is returned so a caller with no wrapper
+    configured (e.g. ``--help``, a module import) still works, and the
+    diagnosis is printed to stderr as a warning instead.
     """
     environment = os.environ if environ is None else environ
     override = environment.get(CLAUDE_TMUX_PATH_ENV, "").strip()
     if override:
-        # ponytail: override tilde expansion still reads the process HOME; the
-        # override path is virtually always absolute, so environ-HOME symmetry
-        # for it is YAGNI (only the fallback path needs injectable HOME).
-        wrapper = os.path.expanduser(override)
+        wrapper = _expand_home_prefix(override, environment)
     else:
         wrapper = shutil.which(_CLAUDE_TMUX_EXECUTABLE)
         home = environment.get("HOME")
@@ -791,12 +810,14 @@ def default_wrapper_cmd(extra_flags="", *, environ=None):
         if wrapper is None and fallback.is_file():
             wrapper = str(fallback)
         if wrapper is None:
-            raise RuntimeError(
-                f"{_CLAUDE_TMUX_EXECUTABLE} not found on PATH and fallback file "
-                f"does not exist at {fallback}; set ${CLAUDE_TMUX_PATH_ENV} or "
-                f"install the wrapper (the pre-migration hardcoded path is no "
-                f"longer checked)"
+            print(
+                f"! {_CLAUDE_TMUX_EXECUTABLE} not found on PATH and fallback "
+                f"file does not exist at {fallback}; set "
+                f"${CLAUDE_TMUX_PATH_ENV} or install the wrapper — falling "
+                f"back to the bare executable name",
+                file=sys.stderr,
             )
+            wrapper = _CLAUDE_TMUX_EXECUTABLE
 
     flags = [flag for flag in shlex.split(extra_flags) if flag != "--yolo"]
     return shlex.join([wrapper, *flags])

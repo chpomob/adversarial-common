@@ -414,24 +414,25 @@ def test_default_wrapper_strips_yolo_flag(monkeypatch, tmp_path):
     assert "--yolo" not in command
 
 
-def test_default_wrapper_cmd_error_distinguishes_path_vs_fallback(
-    monkeypatch, tmp_path
+def test_default_wrapper_cmd_no_raise_without_wrapper(
+    monkeypatch, tmp_path, capsys
 ):
+    # M3: nothing on PATH and no fallback file must not raise — a consumer
+    # module that computes its default command at import time (P10 R2, e.g.
+    # ``DEFAULT_REVIEW_CMD = providers.default_wrapper_cmd()``) and ``--help``
+    # must both keep working with no wrapper configured.
     monkeypatch.setattr(providers.shutil, "which", lambda executable: None)
     fake_home = tmp_path / "no-wrapper-here"
 
-    with pytest.raises(RuntimeError) as caught:
-        default_wrapper_cmd(environ={"HOME": str(fake_home)})
+    command = default_wrapper_cmd(environ={"HOME": str(fake_home)})
 
-    message = str(caught.value)
-    # The two failure causes are named distinctly instead of collapsed into a
-    # single generic "wrapper missing" sentence (finding CO8):
+    assert shlex.split(command) == [providers._CLAUDE_TMUX_EXECUTABLE]
+    # The diagnosis is still surfaced, just as a warning instead of a raise.
+    captured = capsys.readouterr()
+    message = captured.err
     assert "not found on PATH" in message
-    assert "does not exist" in message
     expected_fallback = str(fake_home / "claude-tmux-wrapper" / "claude-tmux.py")
     assert expected_fallback in message
-    # The legacy pre-migration hardcoded path is no longer consulted:
-    assert "no longer checked" in message
 
 
 def test_inject_persona_delimiter_is_optional(tmp_path):

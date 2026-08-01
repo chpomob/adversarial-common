@@ -9,6 +9,7 @@ mutation lands in.
 import os
 import re
 import subprocess
+import uuid
 from pathlib import Path
 
 
@@ -154,6 +155,44 @@ def is_dirty(workdir):
     return bool(out.strip())
 
 
+_STASH_MARKER_PREFIX = "adversarial-loop-stash:"
+
+
+def _new_stash_marker():
+    """Return a unique token embeddable in a stash's ``-m`` message.
+
+    Generating it costs nothing (no git call, cannot fail), so it can be
+    handed to *on_pushed* the instant the push succeeds and later used to
+    find the exact stash by content instead of by position.
+    """
+    return f"{_STASH_MARKER_PREFIX}{uuid.uuid4().hex}"
+
+
+def _resolve_stash_identity(workdir, stash_ref):
+    """Resolve *stash_ref* to its current stash commit SHA.
+
+    A real stash SHA (the normal case, once ``stash_dirty`` has resolved one)
+    resolves directly and unambiguously via ``rev-parse``, regardless of how
+    many other stashes have since been pushed or popped. A push marker (the
+    ``stash_dirty`` interruption/total-failure fallback identity) has no
+    fixed git-rev syntax, so it is instead located by matching the unique
+    message ``stash_dirty`` recorded in the stash's reflog subject at push
+    time — this still finds the right stash even if other stashes were
+    pushed afterward and shifted every position, which a positional
+    ``stash@{0}`` guess would not.
+    """
+    try:
+        return _git(workdir, ["rev-parse", "--verify", stash_ref]).strip()
+    except GitError:
+        pass
+    entries = _git(workdir, ["stash", "list", "--format=%H%x09%gs"]).splitlines()
+    for line in entries:
+        sha, _, subject = line.partition("\t")
+        if stash_ref and stash_ref in subject:
+            return sha.strip()
+    raise GitError(f"could not resolve stash identity {stash_ref!r}")
+
+
 def stash_dirty(workdir, *, on_pushed=None):
     """Stash any dirty changes (including untracked).
 
@@ -161,34 +200,41 @@ def stash_dirty(workdir, *, on_pushed=None):
     remains bound to this stash even if later stash operations change the
     position of ``stash@{0}``.
 
-    After a successful ``git stash push -u`` the new stash is deterministically
-    ``stash@{0}`` — nothing between the push and this return creates another
-    stash — so the id is always recoverable. The SHA is resolved, then, on
-    failure, recovered from the stash reflog head, and finally, if every
-    post-push resolution command fails or is interrupted, the literal
-    ``stash@{0}`` reflog selector is returned (which :func:`unstash`
-    re-resolves at restore time). A caller that records the id only from this
-    return value therefore never orphans a stash it cannot later pop, even
-    when capture is interrupted mid-resolution.
+    The stash is pushed with a unique marker message so it can be found by
+    content rather than by position. After a successful ``git stash push -u``
+    the SHA is resolved via ``stash@{0}`` (deterministic — nothing between
+    the push and this attempt creates another stash); on failure it is
+    recovered by searching the stash list for the marker via
+    :func:`_resolve_stash_identity`, which remains correct even if another
+    stash lands on top before recovery runs. If every post-push resolution
+    command fails or is interrupted, the marker itself is returned (which
+    :func:`unstash` re-resolves the same way at restore time). A caller that
+    records the id only from this return value therefore never orphans a
+    stash it cannot later pop, even when capture is interrupted
+    mid-resolution.
 
-    *on_pushed*, if given, is invoked with the deterministic ``stash@{0}``
-    selector the instant ``git stash push -u`` succeeds and BEFORE any
-    resolution attempt. A caller that records this into its run state is
-    protected against an interruption (e.g. ``KeyboardInterrupt`` — a
-    ``BaseException`` that the resolution guards below do not catch) during
-    the subsequent SHA lookup: even if ``stash_dirty`` itself raises before
-    returning, the state already holds a recoverable id that :func:`unstash`
-    re-resolves at restore time, so the user's stashed work is never orphaned.
+    *on_pushed*, if given, is invoked with the marker the instant
+    ``git stash push -u`` succeeds and BEFORE any resolution attempt — this
+    costs no git call and cannot fail. A caller that records this into its
+    run state is protected against an interruption (e.g. ``KeyboardInterrupt``
+    — a ``BaseException`` that the resolution guards below do not catch)
+    during the subsequent SHA lookup: even if ``stash_dirty`` itself raises
+    before returning, the state already holds a recoverable, position-
+    independent id that :func:`unstash` re-resolves at restore time, so the
+    user's stashed work is never orphaned — even if another stash is pushed
+    on top of it before that restore happens.
     """
     if not is_dirty(workdir):
         return ""
-    _git(workdir, ["stash", "push", "-u"])
+    marker = _new_stash_marker()
+    _git(workdir, ["stash", "push", "-u", "-m", marker])
     if on_pushed is not None:
-        # Record the deterministic id BEFORE resolution, so an interruption
+        # Record the marker BEFORE resolution, so an interruption
         # (KeyboardInterrupt / any BaseException the guards below don't catch)
         # during the SHA lookup still leaves the caller's state holding a
-        # recoverable stash selector instead of an empty id.
-        on_pushed("stash@{0}")
+        # recoverable, position-independent stash identity instead of an
+        # empty id.
+        on_pushed(marker)
     try:
         sha = _git(workdir, ["rev-parse", "--verify", "stash@{0}"]).strip()
         if sha:
@@ -197,28 +243,30 @@ def stash_dirty(workdir, *, on_pushed=None):
         pass
     try:
         # ponytail: rev-parse failed after the push succeeded; recover the
-        # SHA from the stash reflog head instead of orphaning the stash.
-        entries = _git(workdir, ["stash", "list", "--format=%H"]).splitlines()
-        if entries:
-            return entries[0].strip()
+        # SHA by marker instead of orphaning the stash.
+        resolved = _resolve_stash_identity(workdir, marker)
+        if resolved:
+            return resolved
     except (GitError, subprocess.TimeoutExpired):
         pass
-    # ponytail: every post-push resolution failed, but the just-pushed stash
-    # IS stash@{0} (nothing shifted the reflog between the push and here).
-    # Return the reflog selector so unstash re-resolves it at restore time
+    # ponytail: every post-push resolution failed. Return the marker so
+    # unstash re-resolves it (by content, not position) at restore time
     # instead of raising with an empty id and orphaning the user's work. Worst
     # case restore_git reports this id to the user for manual recovery.
-    return "stash@{0}"
+    return marker
 
 
 def unstash(workdir, stash_ref):
     """Pop *stash_ref* by identity, even if its stash position has changed.
 
-    Git accepts only reflog selectors (not raw commit SHAs) for ``stash pop``.
-    Resolve the stable identity to its current position immediately before the
-    pop so a later stash cannot redirect this operation to ``stash@{0}``.
+    *stash_ref* is either a stash commit SHA (the common case) or, for the
+    rare ``stash_dirty`` interruption/failure fallback, an opaque push
+    marker — see :func:`_resolve_stash_identity`. Either form is re-resolved
+    to a SHA and verified against the current stash list immediately before
+    the pop, so a stash pushed later cannot redirect this operation to the
+    wrong entry.
     """
-    stash_sha = _git(workdir, ["rev-parse", "--verify", stash_ref]).strip()
+    stash_sha = _resolve_stash_identity(workdir, stash_ref)
     stash_entries = _git(workdir, ["stash", "list", "--format=%H"]).splitlines()
     try:
         stash_index = stash_entries.index(stash_sha)
@@ -451,13 +499,17 @@ def create_worktree(repo, path, base_ref, branch_name=None):
 def remove_worktree(repo, path):
     """Force-remove a worktree and prune its metadata.
 
-    No-op (not an error) when the worktree does not exist.
+    No-op (not an error) when the worktree does not exist. Raises
+    :class:`GitError` on a genuine git failure (the already-gone case is
+    excluded by the existence check above).
     """
     p = Path(path)
     if not p.exists():
         return
-    _out, _err, rc = _run(repo, ["worktree", "remove", "--force", str(path)])
-    # Exit 0 on success; non-zero when already gone — ignore both.
+    out, err, rc = _run(repo, ["worktree", "remove", "--force", str(path)])
+    if rc != 0:
+        detail = (err or out).strip()
+        raise GitError(f"git worktree remove --force {path} failed: {detail}")
 
 
 def prune_worktrees(repo):

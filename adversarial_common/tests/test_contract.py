@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import ast
 import json
+import shlex
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
 import adversarial_common as ac
-from adversarial_common import costs, gates, runner
+from adversarial_common import costs, gates, gitops, pipeline_base as pb, providers, runner
 
 
 # -- R1: Threshold / env precedence ------------------------------------------
@@ -338,6 +340,30 @@ def test_pipeline_base_dependency_boundary_excludes_consumers_and_providers():
     }
 
 
+def _assert_p22_consumers(consumers):
+    """Assert each existing consumer path avoids ``pipeline_base``.
+
+    A missing consumer is skipped individually (``pytest.skip`` for that path,
+    caught locally) rather than aborting the whole scan — the remaining
+    consumers must still be checked.
+    """
+    for path in consumers:
+        if not path.is_file():
+            try:
+                pytest.skip(
+                    f"sibling skill repo not found: {path} — "
+                    "this gate only runs in a multi-repo dev workspace"
+                )
+            except pytest.skip.Exception:
+                continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "adversarial_common.pipeline_base"
+            for node in ast.walk(tree)
+        ), f"P22 must not migrate {path}"
+
+
 def test_p22_does_not_import_pipeline_base_in_consumers():
     skills = Path(__file__).parents[3]
     consumers = [
@@ -353,18 +379,168 @@ def test_p22_does_not_import_pipeline_base_in_consumers():
             f"sibling skill repo root not found: {skills} — "
             "this gate only runs in a multi-repo dev workspace"
         )
-    for path in consumers:
-        if not path.is_file():
-            pytest.skip(
-                f"sibling skill repo not found: {path} — "
-                "this gate only runs in a multi-repo dev workspace"
-            )
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        assert not any(
-            isinstance(node, ast.ImportFrom)
-            and node.module == "adversarial_common.pipeline_base"
-            for node in ast.walk(tree)
-        ), f"P22 must not migrate {path}"
+    _assert_p22_consumers(consumers)
+
+
+def test_p22_skips_only_missing_consumer_and_still_checks_the_rest(tmp_path):
+    clean_a = tmp_path / "clean_a.py"
+    clean_a.write_text("import os\n")
+    clean_b = tmp_path / "clean_b.py"
+    clean_b.write_text("import sys\n")
+    violating = tmp_path / "violating.py"
+    violating.write_text(
+        "from adversarial_common.pipeline_base import setup_git\n"
+    )
+    missing = tmp_path / "does_not_exist.py"
+
+    # The missing sibling must not abort the scan: the violating file (which
+    # comes after it in the list) is still reached and still fails the gate.
+    with pytest.raises(AssertionError, match="P22 must not migrate"):
+        _assert_p22_consumers([clean_a, missing, clean_b, violating])
+
+
+# -- Review2 fixes: M1-M4 majors, m2-m3 minors -------------------------------
+
+
+def _raw_git(workdir, *args):
+    proc = subprocess.run(["git", *args], capture_output=True, text=True, cwd=workdir)
+    return proc.stdout.strip(), proc.stderr.strip(), proc.returncode
+
+
+def test_stash_identity_is_sha_not_positional(tmp_path):
+    # M1: stash_dirty's returned SHA must stay bound to its own stash even
+    # after a second stash is pushed on top and shifts stash@{0}.
+    gitops.auto_init(tmp_path)
+    (tmp_path / "f.txt").write_text("v1")
+    gitops.commit_all(tmp_path, "base")
+
+    (tmp_path / "f.txt").write_text("v2-first")
+    first_sha = gitops.stash_dirty(tmp_path)
+
+    (tmp_path / "f.txt").write_text("v3-second")
+    second_sha = gitops.stash_dirty(tmp_path)
+    assert first_sha != second_sha
+
+    gitops.unstash(tmp_path, first_sha)
+
+    assert (tmp_path / "f.txt").read_text() == "v2-first"
+    remaining, _, _ = _raw_git(tmp_path, "stash", "list", "--format=%H")
+    assert remaining.splitlines() == [second_sha]
+
+
+def test_truncate_input_with_large_persona_stays_under_cap(tmp_path, monkeypatch):
+    # M2: the persona must never be truncated to make room — the BODY is
+    # capped against the budget left over after the persona + delimiter
+    # overhead, so the final stdin (persona + fences + body) stays <= limit.
+    persona_file = tmp_path / "persona.md"
+    persona_text = "PERSONA " + ("x" * 2000)
+    persona_file.write_text(persona_text)
+    body = "y" * 5000
+
+    def fake_execute(argv, stdin_text, timeout, cwd):
+        return stdin_text or "", "", 0, True, False
+
+    monkeypatch.setattr(runner, "_execute_attempt", fake_execute)
+
+    _, framed_empty = providers.inject_persona(
+        ["fake-cmd"], str(persona_file), "", delimiter=True
+    )
+    overhead = len(framed_empty)
+    limit = overhead + 200  # room for only part of the oversized body
+
+    result = runner.run_cli(
+        "fake-cmd",
+        stdin_text=body,
+        persona_file=str(persona_file),
+        max_input_chars=limit,
+        max_output_chars=limit + 1000,
+        truncate_input=True,
+        max_retries=0,
+    )
+    stdout, _stderr, code = result[0], result[1], result[2]
+    assert code == 0
+    assert len(stdout) <= limit
+    assert persona_text in stdout
+    assert providers._UNTRUSTED_BODY_END in stdout
+
+
+def test_default_wrapper_cmd_no_raise_without_wrapper(monkeypatch, tmp_path):
+    # M3: no wrapper on PATH and no fallback file must not raise — module
+    # import and --help must keep working without a configured wrapper.
+    monkeypatch.setattr(providers.shutil, "which", lambda executable: None)
+    fake_home = tmp_path / "empty-home"
+
+    command = providers.default_wrapper_cmd(environ={"HOME": str(fake_home)})
+
+    assert shlex.split(command) == [providers._CLAUDE_TMUX_EXECUTABLE]
+
+
+class _FakeGitAdapter:
+    """Minimal git_adapter double for setup_git's happy path."""
+
+    def __init__(self):
+        self.resolved_stash = "resolved-stash-sha"
+
+    def detect_enclosing_repo(self, workdir):
+        return "/repo"
+
+    def ensure_git_identity(self, workdir):
+        pass
+
+    def get_current_branch(self, workdir):
+        return "main"
+
+    def stash_dirty(self, workdir, *, on_pushed=None):
+        if on_pushed is not None:
+            on_pushed("push-marker")
+        return self.resolved_stash
+
+    def create_loop_branch(self, workdir, feature, parent, prefix="loop"):
+        return f"{prefix}/{feature}/1"
+
+    def checkout(self, workdir, branch):
+        pass
+
+    def record_branch_point(self, workdir, parent):
+        return "branch-point-sha"
+
+    def ensure_gitignore(self, workdir, entry):
+        pass
+
+
+def test_setup_git_no_state_records_stash_in_result():
+    # M4: setup_git(state=None) must still expose the recorded stash id
+    # through its RESULT, not only into a throwaway local the caller can
+    # never see.
+    fake = _FakeGitAdapter()
+    result = pb.setup_git(
+        "/safe", "feature", None, policy=pb.GitSetupPolicy(git_adapter=fake),
+    )
+    assert result["exit_code"] == 0
+    assert result["stash_id"] == "resolved-stash-sha"
+
+
+def test_override_tilde_uses_injected_home():
+    # m2: the wrapper-path override must expand ``~`` against the injected
+    # environ HOME, not the real process HOME.
+    command = providers.default_wrapper_cmd(
+        environ={"HOME": "/fake", providers.CLAUDE_TMUX_PATH_ENV: "~/w.py"}
+    )
+    assert shlex.split(command) == ["/fake/w.py"]
+
+
+def test_remove_worktree_raises_on_git_failure(tmp_path, monkeypatch):
+    # m3: a genuine git failure (not the already-gone case, excluded by the
+    # existence check) must raise GitError instead of being swallowed.
+    wt_path = tmp_path / "wt"
+    wt_path.mkdir()
+
+    def fake_run(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+        return "", "fatal: could not remove worktree", 1
+
+    monkeypatch.setattr(gitops, "_run", fake_run)
+    with pytest.raises(gitops.GitError):
+        gitops.remove_worktree(str(tmp_path), str(wt_path))
 
 
 # -- R12: Shared fixtures are available -------------------------------------
