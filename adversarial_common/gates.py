@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import os
 import re
 import shlex
@@ -248,6 +249,82 @@ def _run_verification_gate(
     return result
 
 
+def run_contract_gate(
+    spec_path: str | os.PathLike[str],
+    repo_root: str | os.PathLike[str],
+    sandbox_profile: Any = None,
+) -> dict[str, Any]:
+    """Parse, execute, and settle *spec_path*'s ac-directive contract (F1).
+
+    Parses the ``ac-directive`` blocks bound to acceptance criteria in
+    *spec_path* (P2), executes each one in *repo_root* through the shared
+    execution engine under containment (P3/P4), and settles ``"APPROVE"``
+    only when every directive — and every AC it is bound to — passes; a
+    spec with zero directives settles ``"APPROVE"`` vacuously (nothing to
+    enforce). *sandbox_profile*, when given, is threaded through to each
+    directive as its P1 constrained profile instead of per-directive
+    auto-resolution (a caller-scoped override, not global state).
+
+    This is the single gate entry point the spec/plan/review/loop pipelines
+    all import (R2): the same *spec_path* + *repo_root* settle identically
+    regardless of which pipeline calls it, because none of them can alter
+    how a directive is parsed or enforced — only whether they call this at
+    all.
+
+    Returns ``{settle, ac_status, failures, directives}``:
+
+    * ``settle`` — ``"APPROVE"`` or ``"REJECT"``;
+    * ``ac_status`` — ``{ac_id: "pass" | "fail"}``, one entry per AC that
+      carried at least one directive or parse error; an AC with multiple
+      directives is ``"fail"`` if any of them failed;
+    * ``failures`` — ``[{ac, id, reason}, ...]`` for every failing directive
+      or parse error (``id`` is None for a parse error, which has no
+      directive to identify);
+    * ``directives`` — the raw ``run_directive`` result for every
+      well-formed directive that executed, even when other directives in
+      the same spec failed to parse (a parse error on one AC never
+      suppresses the well-formed directives bound to the rest).
+
+    :mod:`adversarial_common.contract` (PyYAML-dependent) is imported via
+    ``importlib`` rather than a top-level import so this module — audited
+    elsewhere as stdlib-only — keeps that guarantee, mirroring the
+    ``importlib.import_module("yaml")`` seam already used in providers.py.
+    """
+    contract = importlib.import_module("adversarial_common.contract")
+    result: dict[str, Any] = {
+        "settle": "REJECT",
+        "ac_status": {},
+        "failures": [],
+        "directives": [],
+    }
+
+    parsed = contract.parse_spec_file(spec_path)
+    for err in parsed.errors:
+        ac_id = err.ac or "UNKNOWN"
+        result["ac_status"][ac_id] = "fail"
+        result["failures"].append(
+            {"ac": ac_id, "id": None, "reason": f"parse error: {err.cause}"}
+        )
+
+    all_pass = parsed.ok
+    for directive in parsed.directives:
+        outcome = contract.run_directive(directive, repo_root, sandbox_profile)
+        result["directives"].append(outcome)
+        status = outcome["status"]
+        prior = result["ac_status"].get(directive.ac, "pass")
+        result["ac_status"][directive.ac] = (
+            "fail" if status != "pass" or prior == "fail" else "pass"
+        )
+        if status != "pass":
+            all_pass = False
+            result["failures"].append(
+                {"ac": directive.ac, "id": outcome["id"], "reason": outcome["message"]}
+            )
+
+    result["settle"] = "APPROVE" if all_pass else "REJECT"
+    return result
+
+
 def _effective_thresholds(kind: str, overrides: Mapping[str, Any] | None) -> dict[str, Any]:
     defaults = _DEFAULT_THRESHOLDS.get(kind, _DEFAULT_THRESHOLDS["input"])
     effective = {
@@ -442,5 +519,5 @@ def _positive_number(name: str, value: Any) -> float:
 __all__ = [
     "TRUNCATION_MARKER", "check_context", "enforce_input_cap",
     "enforce_output_cap", "estimate_complexity", "post_build_gate",
-    "post_fix_gate", "pre_build_gate",
+    "post_fix_gate", "pre_build_gate", "run_contract_gate",
 ]

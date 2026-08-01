@@ -404,6 +404,198 @@ def test_invalid_command_sequence_returns_structured_failure(tmp_path, gate):
     _assert_gate_result_shape(result)
 
 
+# -- P5: shared executable-contract settle gate (gates.run_contract_gate) --
+#
+# [R2, R3; AC3, AC3a, AC4]. AC1/AC2 drive the settle decision itself; AC3/
+# AC3a prove that decision is identical no matter which of the four
+# pipelines' import path reaches it (the shared entry point for F1
+# enforcement, R2) — both for a spec that settles APPROVE and one that
+# settles REJECT. AC4 is the full suite, exercised by CI rather than a
+# single test here.
+
+
+def _env_with_identity():
+    return {
+        **os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.co",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.co",
+    }
+
+
+def _init_contract_repo(root, files):
+    """Init a throwaway git repo at *root* with *files* ({relpath: text}) committed."""
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=_env_with_identity())
+    for relpath, text in files.items():
+        (root / relpath).write_text(text)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "base"], cwd=root, check=True, env=_env_with_identity(),
+    )
+
+
+def _write_two_ac_spec(spec_path, *, ac2_pattern):
+    """A spec with grep directives bound to AC1 (always matches) and AC2
+    (matches *ac2_pattern* in tracked.txt) — grep needs no containment (R1),
+    so these settle deterministically on any host, sandboxed or not."""
+    spec_path.write_text(
+        "# Spec\n\n"
+        "## Acceptance criteria\n\n"
+        "- AC1: has foo\n"
+        "  ```ac-directive\n"
+        "  ac: AC1\n"
+        "  kind: grep\n"
+        "  command: grep foo tracked.txt\n"
+        "  ```\n"
+        "- AC2: has the target token\n"
+        "  ```ac-directive\n"
+        "  ac: AC2\n"
+        "  kind: grep\n"
+        f"  command: grep {ac2_pattern} tracked.txt\n"
+        "  ```\n"
+    )
+
+
+def test_contract_gate_approves_when_all_pass(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_contract_repo(repo, {"tracked.txt": "foo line\nbar line\n"})
+    spec_path = tmp_path / "spec.md"
+    _write_two_ac_spec(spec_path, ac2_pattern="bar")
+
+    result = gates.run_contract_gate(str(spec_path), str(repo))
+
+    assert result["settle"] == "APPROVE", result
+    assert result["ac_status"] == {"AC1": "pass", "AC2": "pass"}
+    assert result["failures"] == []
+    assert len(result["directives"]) == 2
+    assert all(d["status"] == "pass" for d in result["directives"])
+
+
+def test_contract_gate_rejects_on_single_failure(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # AC2's pattern is absent from tracked.txt -> that one directive fails.
+    _init_contract_repo(repo, {"tracked.txt": "foo line\nno match here\n"})
+    spec_path = tmp_path / "spec.md"
+    _write_two_ac_spec(spec_path, ac2_pattern="missingtoken")
+
+    result = gates.run_contract_gate(str(spec_path), str(repo))
+
+    assert result["settle"] == "REJECT", result
+    assert result["ac_status"] == {"AC1": "pass", "AC2": "fail"}
+    assert len(result["failures"]) == 1
+    failure = result["failures"][0]
+    assert failure["ac"] == "AC2"
+    assert failure["reason"] == "absent"
+
+
+def test_contract_gate_runs_valid_directives_despite_a_sibling_parse_error(tmp_path):
+    # AC1 is well-formed and would pass; AC2's directive has an unknown
+    # `kind`, so it's a parse error rather than a directive. The parse
+    # error must not suppress AC1 from running and appearing in the result.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_contract_repo(repo, {"tracked.txt": "foo line\n"})
+    spec_path = tmp_path / "spec.md"
+    spec_path.write_text(
+        "# Spec\n\n"
+        "## Acceptance criteria\n\n"
+        "- AC1: has foo\n"
+        "  ```ac-directive\n"
+        "  ac: AC1\n"
+        "  kind: grep\n"
+        "  command: grep foo tracked.txt\n"
+        "  ```\n"
+        "- AC2: malformed\n"
+        "  ```ac-directive\n"
+        "  ac: AC2\n"
+        "  kind: not-a-real-kind\n"
+        "  command: grep foo tracked.txt\n"
+        "  ```\n"
+    )
+
+    result = gates.run_contract_gate(str(spec_path), str(repo))
+
+    assert result["settle"] == "REJECT", result
+    assert result["ac_status"]["AC1"] == "pass"
+    assert result["ac_status"]["AC2"] == "fail"
+    assert len(result["directives"]) == 1
+    assert result["directives"][0]["status"] == "pass"
+    assert any(
+        f["ac"] == "AC2" and f["id"] is None and "parse error" in f["reason"]
+        for f in result["failures"]
+    )
+
+
+# Each pipeline's own bootstrap (see the top of e.g. adversarial_spec.py)
+# does exactly this: put the pipeline's own script dir and the
+# adversarial-common skill root on sys.path, then import adversarial_common.
+_PIPELINE_ENTRY_SCRIPTS = (
+    "adversarial-spec/scripts/adversarial_spec.py",
+    "adversarial-plan/scripts/adversarial_plan.py",
+    "adversarial-code-loop/scripts/adversarial_loop_v4.py",
+    "adversarial-code-review/scripts/adversarial_review.py",
+)
+
+_SUBPROCESS_GATE_SCRIPT = """
+import json
+import sys
+
+sys.path.insert(0, sys.argv[1])
+sys.path.insert(0, sys.argv[2])
+
+from adversarial_common.gates import run_contract_gate
+
+result = run_contract_gate(sys.argv[3], sys.argv[4])
+print(json.dumps({"settle": result["settle"], "ac_status": result["ac_status"]}))
+"""
+
+
+def _settle_via_pipeline_import_path(pipeline_root, common_root, spec_path, repo_root):
+    """Run run_contract_gate in a fresh subprocess using one pipeline's own
+    sys.path bootstrap, so the import genuinely happens by that pipeline's
+    path rather than reusing this test process's already-cached module."""
+    proc = subprocess.run(
+        [
+            sys.executable, "-c", _SUBPROCESS_GATE_SCRIPT,
+            str(pipeline_root), str(common_root), str(spec_path), str(repo_root),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+@pytest.mark.parametrize("expect_approve", [True, False])
+def test_contract_gate_identical_across_pipelines(tmp_path, expect_approve):
+    skills = Path(__file__).resolve().parents[3]
+    common_root = skills / "adversarial-common"
+    scripts = [skills / rel for rel in _PIPELINE_ENTRY_SCRIPTS]
+    missing = [str(p) for p in scripts if not p.is_file()]
+    if missing:
+        pytest.skip(
+            f"sibling skill repo(s) not found: {missing} — "
+            "this gate only runs in a multi-repo dev workspace"
+        )
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    text = "foo line\nbar line\n" if expect_approve else "foo line\nno match here\n"
+    _init_contract_repo(repo, {"tracked.txt": text})
+    spec_path = tmp_path / "spec.md"
+    _write_two_ac_spec(spec_path, ac2_pattern=("bar" if expect_approve else "missingtoken"))
+
+    settled = [
+        _settle_via_pipeline_import_path(
+            script.parent.parent, common_root, spec_path, repo,
+        )
+        for script in scripts
+    ]
+
+    expected_settle = "APPROVE" if expect_approve else "REJECT"
+    assert all(s["settle"] == expected_settle for s in settled), settled
+    assert all(s == settled[0] for s in settled), settled
+
+
 def _assert_gate_result_shape(result):
     assert {
         "gate",

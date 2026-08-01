@@ -1193,8 +1193,16 @@ def _infra_failure(result: dict[str, Any], message: str) -> dict[str, Any]:
     return result
 
 
-def run_directive(directive: "Directive", repo_root: str | Any) -> dict[str, Any]:
+def run_directive(
+    directive: "Directive", repo_root: str | Any, profile: Any = None,
+) -> dict[str, Any]:
     """Execute one parsed *directive* in *repo_root* under fixed semantics.
+
+    *profile*, when given, is used directly as the P1 constrained profile for
+    a shell/no-diff directive instead of auto-resolving one via
+    :func:`_resolve_profile` — a caller-scoped override (e.g. a shared
+    settle gate threading one profile through many directives) rather than
+    global state, so concurrent callers with different profiles never race.
 
     Returns ``{id, status, command, timed_out, message, truncated_output,
     infra, denials}``:
@@ -1311,7 +1319,7 @@ def run_directive(directive: "Directive", repo_root: str | Any) -> dict[str, Any
     # worktree + ephemeral scratch). When the runtime cannot provide or
     # enforce that profile, the directive fails as infrastructure rather than
     # executing at ambient privilege (R1/R2, F4 safe-degradation).
-    profile = _resolve_profile(repo_root)
+    profile = profile if profile is not None else _resolve_profile(repo_root)
     if profile is None:
         return _infra_failure(result, "no constrained execution profile available")
 
