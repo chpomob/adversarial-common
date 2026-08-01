@@ -16,7 +16,15 @@ from pathlib import Path
 import pytest
 
 import adversarial_common as ac
-from adversarial_common import costs, gates, gitops, pipeline_base as pb, providers, runner
+from adversarial_common import (
+    contract as _contract,
+    costs,
+    gates,
+    gitops,
+    pipeline_base as pb,
+    providers,
+    runner,
+)
 
 
 # -- R1: Threshold / env precedence ------------------------------------------
@@ -558,3 +566,169 @@ def test_priced_ledger_fixture_has_test_model_price(priced_ledger):
     price = priced_ledger.price_for("test-model")
     assert price["prompt"] == 1.0
     assert price["completion"] == 2.0
+
+
+# -- P2: ac-directive parser (adversarial_common.contract) ------------------
+#
+# The directive parser binds spec.md acceptance criteria to machine-enforced
+# checks. These tests cover the happy-path round-trip (AC1), every validation
+# error case (AC1), the prose-only AC (AC2), and the location-binding rule
+# (AC3).
+
+
+def _one_directive_spec(info, body):
+    """A spec whose AC1 carries a single fenced directive."""
+    return (
+        "# Spec\n\n## Acceptance criteria\n\n"
+        "- AC1: criterion\n"
+        f"  ```{info}\n{body}\n  ```\n"
+    )
+
+
+# (name) -> (info string, directive body); each must yield exactly one parse
+# error whose cause contains the matching substring in _EXPECTED_CAUSE.
+_DIRECTIVE_ERROR_CASES = {
+    "unknown kind": (
+        "ac-directive", "ac: AC1\nkind: frobnicate\ncommand: grep foo",
+    ),
+    "missing command": (
+        "ac-directive", "ac: AC1\nkind: grep",
+    ),
+    "missing ac": (
+        "ac-directive", "kind: grep\ncommand: grep foo",
+    ),
+    "unbound ac": (
+        "ac-directive", "ac: AC99\nkind: grep\ncommand: grep foo",
+    ),
+    "bad info string": (
+        "ac-directive x", "ac: AC1\nkind: grep\ncommand: grep foo",
+    ),
+    "malformed YAML": (
+        "ac-directive", "ac: AC1\nfoo: [unclosed",
+    ),
+    "illegal expected": (
+        "ac-directive",
+        "ac: AC1\nkind: no-diff\nexpected: 0\ncommand: git status",
+    ),
+}
+
+_EXPECTED_CAUSE = {
+    "unknown kind": "unknown kind",
+    "missing command": "missing command",
+    "missing ac": "missing ac",
+    "unbound ac": "unbound ac",
+    "bad info string": "bad info string",
+    "malformed YAML": "malformed YAML",
+    "illegal expected": "illegal expected",
+}
+
+
+def test_parses_directives():
+    # AC1: one grep, one shell (block-scalar command + non-default
+    # expected/timeout), one no-diff (quoted multi-line command) round-trip
+    # verbatim; then every error case is a parse error with a cause.
+    happy = (
+        "# Spec\n\n"
+        "## Requirements\n\n- R1: parse directives\n\n"
+        "## Acceptance criteria\n\n"
+        "- AC1: `test_parses_directives` — round-trip\n"
+        "  ```ac-directive\n"
+        "  ac: AC1\n"
+        "  kind: grep\n"
+        '  command: grep -n "foo" src/*.py\n'
+        "  ```\n"
+        "  ```ac-directive\n"
+        "  ac: AC1\n"
+        "  kind: shell\n"
+        "  expected: 0\n"
+        "  timeout: 120\n"
+        "  command: |\n"
+        "    set -e\n"
+        "    ./build.sh\n"
+        "    ./test.sh\n"
+        "  ```\n"
+        "  ```ac-directive\n"
+        "  ac: AC1\n"
+        "  kind: no-diff\n"
+        '  command: "git diff --quiet\\nexit 0"\n'
+        "  ```\n"
+        "- AC2: other\n"
+    )
+    res = _contract.parse_spec(happy)
+    assert res.ok, res.errors
+    assert len(res.directives) == 3
+    by_kind = {d.kind: d for d in res.directives}
+
+    grep = by_kind["grep"]
+    assert grep.ac == "AC1"
+    assert grep.command == b'grep -n "foo" src/*.py'
+    assert grep.timeout == 60            # default
+    assert grep.files == ("*",)          # default for grep
+    assert grep.expected is None
+
+    shell = by_kind["shell"]
+    assert shell.command == b"set -e\n./build.sh\n./test.sh\n"  # block-scalar verbatim
+    assert shell.expected == 0           # non-default
+    assert shell.timeout == 120          # non-default
+    assert shell.files == ()             # files not valid for shell
+
+    nodiff = by_kind["no-diff"]
+    assert nodiff.command == b"git diff --quiet\nexit 0"  # quoted multi-line verbatim
+    assert nodiff.files == ("*",)        # default for no-diff
+    assert nodiff.expected is None
+
+    # every error case surfaces as a parse error with a cause, no directive
+    for name, (info, body) in _DIRECTIVE_ERROR_CASES.items():
+        err_res = _contract.parse_spec(_one_directive_spec(info, body))
+        assert not err_res.ok, f"{name}: expected an error"
+        assert err_res.errors, f"{name}: no errors recorded"
+        cause = err_res.errors[0].cause
+        assert _EXPECTED_CAUSE[name] in cause, (
+            f"{name}: expected cause mentioning {_EXPECTED_CAUSE[name]!r}, "
+            f"got {cause!r}"
+        )
+        assert err_res.directives == [], (
+            f"{name}: a bad directive must not be produced"
+        )
+
+    # duplicate (ac, kind): the first directive is kept, the second is flagged.
+    dup = (
+        "# Spec\n\n## Acceptance criteria\n\n- AC1: criterion\n"
+        "  ```ac-directive\nac: AC1\nkind: grep\ncommand: grep foo\n  ```\n"
+        "  ```ac-directive\nac: AC1\nkind: grep\ncommand: grep bar\n  ```\n"
+    )
+    dup_res = _contract.parse_spec(dup)
+    assert not dup_res.ok
+    assert any("duplicate" in e.cause for e in dup_res.errors)
+    assert len(dup_res.directives) == 1
+
+
+def test_prose_only_ac_not_enforced():
+    # AC2: an AC with no directive yields zero directives and stays clean.
+    spec = (
+        "# Spec\n\n## Acceptance criteria\n\n"
+        "- AC1: prose only, no directive\n"
+        "- AC2: also just prose\n"
+    )
+    res = _contract.parse_spec(spec)
+    assert res.ok
+    assert res.directives == []
+
+
+def test_directive_location_binding():
+    # AC3: a well-formed block whose declared ac does not match its placement
+    # (here declared AC1 but placed under AC2) is a parse error.
+    spec = (
+        "# Spec\n\n## Acceptance criteria\n\n"
+        "- AC1: one\n"
+        "- AC2: two\n"
+        "  ```ac-directive\n"
+        "  ac: AC1\n"
+        "  kind: grep\n"
+        "  command: grep foo bar\n"
+        "  ```\n"
+    )
+    res = _contract.parse_spec(spec)
+    assert not res.ok
+    assert any("misplaced" in e.cause for e in res.errors)
+    assert res.directives == []
