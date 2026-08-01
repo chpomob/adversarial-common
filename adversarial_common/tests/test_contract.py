@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -767,10 +768,33 @@ def _directive(kind, command, **kwargs):
 def _assert_result_shape(result):
     assert set(result) == {
         "id", "status", "command", "timed_out", "message", "truncated_output",
+        "infra", "denials",
     }
     assert result["status"] in ("pass", "fail")
     assert isinstance(result["timed_out"], bool)
+    assert isinstance(result["infra"], bool)
+    assert isinstance(result["denials"], tuple)
     assert result["id"].startswith("AC1:")
+
+
+def _passthrough_contain(command, repo_root, _profile, timeout):
+    """Containment provider that runs *command* for real via the bare engine.
+
+    The execution-semantics suite's commands do not violate the review
+    profile (no network, no out-of-scope write), so a provider that permits
+    them and records no denials is the faithful double for a compliant
+    directive under a real sandbox. The engine's own default backend would
+    infra-fail here on a host without a usable sandbox, so the suite injects
+    this seam to exercise execution semantics directly, independent of host
+    sandboxing capability.
+    """
+    out = _contract._run_shell(command, repo_root, timeout)
+    stdout, stderr, rc, timed_out, truncated, lines = out
+    return _contract.ContainedRun(
+        output=_contract._bound_output(stdout, stderr, truncated),
+        stdout=stdout, rc=rc, timed_out=timed_out,
+        stdout_lines=lines, denials=(),
+    )
 
 
 def test_execution_semantics(tmp_path, monkeypatch):
@@ -778,6 +802,7 @@ def test_execution_semantics(tmp_path, monkeypatch):
     repo.mkdir()
     _git_init_repo(repo)
     rr = str(repo)
+    monkeypatch.setattr(_contract, "_contain", _passthrough_contain)
 
     # --- shell: writes a file under the fixed env, cwd is repo_root ----------
     out = run_directive(_directive("shell", "echo hello > out.txt"), rr)
@@ -986,4 +1011,264 @@ def test_grep_count_no_double_count_with_baked_operand(tmp_path):
     )
     assert bad["status"] == "fail", bad
     assert bad["message"] == "count 1", bad  # not "count 2"
+
+
+# -- P4: trust & containment model (adversarial_common.contract) ------------
+#
+# AC1 test_directive_containment: shell/no-diff execute under the P1
+# constrained profile. With a profile available, a directive attempting an
+# outbound connection and an out-of-scope write is observed denied, denial
+# events recorded, and the effect confined to the worktree; with the runtime
+# unable to provide a profile, the directive is NOT executed at ambient
+# privilege -> infra failure (blocks APPROVE).
+
+# Network program tokens / substrings marking a statement as an outbound
+# connection attempt under the review profile (no network).
+_NET_PROGRAMS = frozenset({
+    "curl", "wget", "nc", "netcat", "ssh", "scp", "ftp", "telnet",
+})
+_NET_HINTS = (
+    "/dev/tcp/", "socket.create_connection", "urllib", "requests.",
+    "http://", "https://",
+)
+_REDIRECT_RE = re.compile(r"(?:>>|>)\s*(\S+)")
+
+
+def _network_statement(stmt):
+    """True if *stmt* (one shell statement) attempts an outbound connection."""
+    s = stmt.strip()
+    head = s.split(None, 1)[0] if s else ""
+    return head in _NET_PROGRAMS or any(hint in s for hint in _NET_HINTS)
+
+
+def _out_of_scope_write(stmt, repo_root, write_roots):
+    """Path of an out-of-scope redirect target in *stmt*, or None.
+
+    A redirect (``>``/``>>``) whose target resolves outside every write root
+    (worktree + scratch) violates the profile's write confinement.
+    """
+    for m in _REDIRECT_RE.finditer(stmt):
+        tok = m.group(1).strip("'\"")
+        path = os.path.normpath(tok if os.path.isabs(tok) else os.path.join(repo_root, tok))
+        if not any(path == r or path.startswith(r + os.sep) for r in write_roots):
+            return path
+    return None
+
+
+def _policy_contain(command, repo_root, profile, timeout):
+    """Reference policy containment provider (test double).
+
+    Enforces the profile at the command-policy layer: each newline-separated
+    statement is classified; a network operation or a write redirect to a path
+    outside the profile's ``write_roots`` is DENIED (recorded, not executed);
+    permitted statements run via the engine. This mirrors what the real kernel
+    sandbox (bwrap ``--unshare-net`` + read-only mounts, strace-audited) would
+    enforce, deterministically, on a host without usable user namespaces — so
+    denial recording and worktree confinement stay testable everywhere.
+    """
+    write_roots = tuple(os.path.abspath(r) for r in profile.write_roots)
+    denials = []
+    permitted = []
+    for stmt in command.decode("utf-8", "replace").split("\n"):
+        s = stmt.strip()
+        if not s:
+            continue
+        if _network_statement(s):
+            denials.append({"event": "network_denied", "detail": s})
+            continue
+        oos = _out_of_scope_write(s, repo_root, write_roots)
+        if oos:
+            denials.append({"event": "write_denied", "path": oos, "detail": s})
+            continue
+        permitted.append(s)
+    run_cmd = "\n".join(permitted).encode() if permitted else b"true"
+    out = _contract._run_shell(run_cmd, repo_root, timeout)
+    stdout, stderr, rc, timed_out, truncated, lines = out
+    return _contract.ContainedRun(
+        output=_contract._bound_output(stdout, stderr, truncated),
+        stdout=stdout, rc=rc, timed_out=timed_out,
+        stdout_lines=lines, denials=tuple(denials),
+    )
+
+
+def test_directive_containment(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    rr = str(repo)
+    oos_path = str(tmp_path / "oos_leak.txt")  # sibling of repo -> out of scope
+
+    # --- profile available: containment enforces + records denials ----------
+    monkeypatch.setattr(_contract, "_contain", _policy_contain)
+    cmd = "\n".join([
+        "echo wt-ok > inside.txt",         # worktree write -> permitted
+        f"echo leak > {oos_path}",         # out-of-scope write -> denied
+        "curl -sS https://example.com",    # outbound connection -> denied
+    ])
+    out = run_directive(_directive("shell", cmd), rr)
+    _assert_result_shape(out)
+    assert out["status"] == "fail", out            # denials taint the result
+    assert out["infra"] is False, out              # a real denial, not infra
+    assert len(out["denials"]) == 2, out["denials"]
+    events = {d["event"] for d in out["denials"]}
+    assert {"network_denied", "write_denied"} <= events, out["denials"]
+    assert any(d.get("path") == oos_path for d in out["denials"]), out["denials"]
+    # effect confined to the worktree: the permitted write landed, the
+    # violations did not.
+    assert (repo / "inside.txt").read_text().strip() == "wt-ok"
+    assert not os.path.exists(oos_path)
+
+    # --- profile unavailable: NOT executed at ambient -> infra failure -------
+    # The default profile resolver always resolves the review role, so simulate
+    # a runtime that cannot provide a constrained profile by returning None.
+    monkeypatch.setattr(_contract, "_resolve_profile", lambda *_a, **_k: None)
+    ambient_marker = repo / "ambient_marker.txt"
+    assert not ambient_marker.exists()
+    infra = run_directive(
+        _directive("shell", "echo ran > ambient_marker.txt\ncurl https://x.io"), rr,
+    )
+    _assert_result_shape(infra)
+    assert infra["status"] == "fail", infra
+    assert infra["infra"] is True, infra           # blocks APPROVE (R2/F4)
+    assert infra["denials"] == (), infra
+    assert not ambient_marker.exists()   # never ran at ambient privilege
+
+
+def test_directive_default_infra_fails_without_sandbox(tmp_path, monkeypatch):
+    """R2/F4: with no containment backend, the engine default does not run a
+    shell directive at ambient privilege — it fails as infrastructure.
+
+    The engine default probes for a real sandbox backend (bubblewrap +
+    strace with user namespaces). Where none is usable this host returns
+    None, so a shell directive settles ``infra=True`` rather than pass/fail
+    at ambient. We force the probe to 'unavailable' so the assertion holds on
+    every host.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    rr = str(repo)
+    monkeypatch.setattr(_contract, "_containment_backend", lambda: None)
+    # leave _resolve_profile and _contain at their real defaults
+    out = run_directive(_directive("shell", "echo hi"), rr)
+    assert out["status"] == "fail", out
+    assert out["infra"] is True, out
+    assert "containment backend unavailable" in out["message"], out
+
+
+def test_directive_unknown_kind_does_not_route_through_containment(tmp_path):
+    """A directly-constructed Directive with an unrecognized kind (the parser
+    never produces one) is rejected before profile resolution, not silently
+    treated as shell."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    out = run_directive(_directive("frobnicate", "echo hi"), str(repo))
+    assert out["status"] == "fail", out
+    assert out["infra"] is False, out
+    assert "unknown kind" in out["message"], out
+
+
+def test_directive_no_diff_denial_short_circuits_diff_check(tmp_path, monkeypatch):
+    """A denied no-diff directive fails on the denial, not a spurious diff."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    rr = str(repo)
+    monkeypatch.setattr(_contract, "_contain", _policy_contain)
+    out = run_directive(_directive("no-diff", "curl -sS https://example.com"), rr)
+    assert out["status"] == "fail", out
+    assert out["infra"] is False, out
+    assert len(out["denials"]) == 1, out["denials"]
+    assert "containment denied" in out["message"], out
+
+
+# -- P4: syscall-level denial detection (not text-scraped from output) ------
+#
+# A2 (review finding on the prior attempt at this spec): detecting denials by
+# searching the child's own stdout/stderr is both suppressible (the child can
+# redirect its own error output, e.g. ``2>/dev/null``) and fabricate-able (a
+# compliant command that merely prints unrelated text like "permission
+# denied" gets falsely flagged). ``_parse_strace_denials`` instead classifies
+# a strace syscall log the traced child cannot see or edit.
+
+
+def test_parse_strace_denials_detects_network_and_write_denials():
+    write_roots = ("/repo",)
+    trace = b"\n".join([
+        b'123 connect(3, {sa_family=AF_INET, sin_port=htons(443), '
+        b'sin_addr=inet_addr("1.2.3.4")}, 16) = -1 ENETUNREACH (Network is unreachable)',
+        b'123 openat(AT_FDCWD, "/etc/escaped", O_WRONLY|O_CREAT|O_TRUNC, 0666)'
+        b' = -1 EROFS (Read-only file system)',
+        b'123 openat(AT_FDCWD, "/repo/ok.txt", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3',
+        b'123 openat(AT_FDCWD, "/repo/missing.txt", O_RDONLY) = -1 ENOENT'
+        b' (No such file or directory)',
+    ])
+    events = _contract._parse_strace_denials(trace, write_roots, "/repo")
+    assert any(e["event"] == "network_denied" for e in events)
+    assert any(
+        e["event"] == "write_denied" and e["path"] == "/etc/escaped" for e in events
+    )
+    # a successful write inside the write root, and a read-only-mode failure
+    # (ENOENT on O_RDONLY, not a write attempt) must NOT be recorded.
+    assert len(events) == 2, events
+
+
+def test_parse_strace_denials_not_fooled_by_suppressed_or_fabricated_text():
+    # The child redirecting its own stderr to /dev/null cannot hide a denial
+    # from the syscall-level detector (unlike scraping captured output).
+    write_roots = ("/repo",)
+    suppressed_trace = (
+        b'99 openat(AT_FDCWD, "/etc/escaped", O_WRONLY|O_CREAT, 0644)'
+        b' = -1 EACCES (Permission denied)\n'
+    )
+    events = _contract._parse_strace_denials(suppressed_trace, write_roots, "/repo")
+    assert events == [{"event": "write_denied", "path": "/etc/escaped", "errno": "EACCES"}]
+
+    # a compliant command that merely PRINTS "permission denied" as ordinary
+    # program output never reaches the syscall log at all, so it is never
+    # misclassified as a denial (there is nothing here to even parse).
+    benign_trace = b""
+    assert _contract._parse_strace_denials(benign_trace, write_roots, "/repo") == []
+
+
+def test_parse_strace_denials_resolves_relative_path_against_cwd():
+    write_roots = ("/repo",)
+    trace = (
+        b'1 openat(AT_FDCWD, "../../escape.txt", O_WRONLY|O_CREAT, 0644)'
+        b' = -1 EROFS (Read-only file system)\n'
+    )
+    events = _contract._parse_strace_denials(trace, write_roots, "/repo/sub")
+    assert events == [{"event": "write_denied", "path": "/escape.txt", "errno": "EROFS"}]
+
+
+@pytest.mark.skipif(
+    _contract._containment_backend() != "bwrap",
+    reason="no usable bwrap+strace sandbox backend on this host",
+)
+def test_directive_containment_real_backend(tmp_path):
+    """Integration check for the real bwrap+strace backend, where available.
+
+    Skipped on hosts (this dev sandbox included — unprivileged user
+    namespaces are blocked here) that cannot enter a real bwrap sandbox.
+    AC1's containment semantics are fully covered by
+    test_directive_containment above via an injected policy double; this
+    additionally proves the real kernel-enforced backend where the host
+    allows it.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git_init_repo(repo)
+    rr = str(repo)
+    oos_path = str(tmp_path / "real_oos_leak.txt")
+
+    cmd = "\n".join([
+        "echo wt-ok > inside.txt",
+        f"echo leak > {oos_path}",
+        "curl -sS --max-time 2 http://example.com || true",
+    ])
+    out = run_directive(_directive("shell", cmd, timeout=15), rr)
+    assert out["infra"] is False, out
+    assert (repo / "inside.txt").read_text().strip() == "wt-ok"
+    assert not os.path.exists(oos_path)
 

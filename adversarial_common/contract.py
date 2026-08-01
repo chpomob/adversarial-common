@@ -14,10 +14,13 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
 import select
 import shlex
+import shutil
 import signal
 import subprocess
+import tempfile
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -81,6 +84,7 @@ _YAML12Loader.add_implicit_resolver(
 )
 
 __all__ = [
+    "ContainedRun",
     "Directive",
     "MAX_DIRECTIVE_OUTPUT",
     "ParseError",
@@ -120,6 +124,24 @@ class Directive:
     expected: Any | None = None
     timeout: int = _DEFAULT_TIMEOUT
     files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ContainedRun:
+    """Outcome of a command run under a containment profile (P4).
+
+    Mirrors the bare-execution shape plus ``denials``: structured events the
+    enforcer observed for operations it denied (a blocked network attempt, an
+    out-of-scope write). ``denials`` flows into the directive result so a
+    caller can see why a contained directive did not cleanly pass (R3).
+    """
+
+    output: str
+    stdout: bytes
+    rc: int | None
+    timed_out: bool
+    stdout_lines: int
+    denials: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -418,8 +440,16 @@ def _kill_group(proc: subprocess.Popen) -> None:
             pass
 
 
-def _run_shell(command: bytes, repo_root: str, timeout: int):
+def _run_shell(
+    command: bytes, repo_root: str, timeout: int,
+    *, argv: list[str] | None = None, env: dict[str, str] | None = None,
+):
     """Run *command* (a sh script) in *repo_root* under the fixed env.
+
+    *argv* defaults to a bare ``sh`` reading the script from stdin; a caller
+    (e.g. the containment path) may substitute a wrapper argv (strace/bwrap)
+    that itself ultimately execs ``sh`` reading stdin, so *command* is always
+    delivered the same way. *env* defaults to :func:`_directive_env`.
 
     Returns ``(stdout, stderr, returncode, timed_out, truncated,
     stdout_lines)``. Output is read incrementally and capped at
@@ -434,12 +464,12 @@ def _run_shell(command: bytes, repo_root: str, timeout: int):
     truncated.
     """
     proc = subprocess.Popen(
-        [_POSIX_SH],
+        argv if argv is not None else [_POSIX_SH],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=repo_root,
-        env=_directive_env(repo_root),
+        env=env if env is not None else _directive_env(repo_root),
         start_new_session=True,
     )
     deadline = time.monotonic() + timeout
@@ -801,17 +831,396 @@ def _execute(command: bytes, repo_root: str, timeout: int):
     return output, stdout, rc, timed_out, interrupt, stdout_lines
 
 
+# -- containment (P4) --------------------------------------------------------
+#
+# shell/no-diff directives execute arbitrary commands, so they are routed
+# through the P1 constrained profile: read access to the tree, NO network,
+# writes confined to the worktree + an ephemeral scratch dir. grep is an
+# inert pattern match over named files and needs no confinement (R1).
+#
+# The profile itself is data resolved from providers (P1's SandboxMode); this
+# module ENFORCES it. Enforcement is delegated to an injectable seam
+# (``_contain``) so a host without a real sandbox backend fails as
+# infrastructure (R2/F4) instead of running at ambient privilege, and tests
+# can drive denial recording deterministically without depending on host
+# sandboxing capabilities.
+
+
+def _resolve_profile(repo_root: str) -> Any:
+    """Resolve the P1 constrained profile for directive execution.
+
+    Returns the review-role :class:`~adversarial_common.providers.SandboxMode`
+    (read-only, no-network, writes bounded to the worktree + an ephemeral
+    scratch) or None when the runtime cannot provide one. None makes the
+    caller fail as infrastructure rather than execute at ambient privilege
+    (R2). Lazy-imported so this module stays importable without providers.
+    """
+    try:
+        from .providers import ProviderConfigError, resolve_sandbox_mode
+    except Exception:
+        return None
+    try:
+        return resolve_sandbox_mode("review", workdir=repo_root)
+    except ProviderConfigError:
+        return None
+
+
+# Read-only system paths bound into the sandbox so ordinary tooling (a shell,
+# coreutils, an interpreter, TLS trust roots) resolves. Deliberately NOT the
+# whole host ``/`` — a blanket ``--ro-bind / /`` also exposes host-only
+# sockets (docker.sock, D-Bus, X11, tmux) that a read-only mount does not
+# block from ``connect(2)``, defeating containment via an accessible host
+# daemon. ``/tmp`` and ``/run`` (common socket homes) get a fresh, empty
+# tmpfs instead of a host bind; ``/home`` is never bound.
+_RO_SYSTEM_DIRS: Final = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/opt")
+
+_BWRAP: Final = shutil.which("bwrap")
+_STRACE: Final = shutil.which("strace")
+_backend_choice: str | None = None
+_backend_probed = False
+
+
+def _bwrap_ro_binds() -> list[str]:
+    args: list[str] = []
+    for path in _RO_SYSTEM_DIRS:
+        if os.path.isdir(path):
+            args += ["--ro-bind", path, path]
+    return args
+
+
+def _bwrap_base_argv() -> list[str]:
+    """Namespace + read-only mount setup shared by the probe and real runs."""
+    return [
+        _BWRAP,
+        "--unshare-net", "--unshare-ipc", "--unshare-pid",
+        "--die-with-parent", "--new-session",
+        "--dev", "/dev", "--proc", "/proc",
+        "--tmpfs", "/tmp", "--tmpfs", "/run",
+        *_bwrap_ro_binds(),
+    ]
+
+
+def _containment_backend() -> str | None:
+    """Cached probe: which real containment backend (if any) is usable here.
+
+    Both bubblewrap (kernel enforcement) and strace (tamper-resistant denial
+    detection, R3) must work — without strace, denials could only be inferred
+    from the child's own stdout/stderr, which it can suppress or fabricate, so
+    a host missing either tool cannot provide the profile this module needs.
+    """
+    global _backend_choice, _backend_probed
+    if not _backend_probed:
+        _backend_choice = _probe_bwrap()
+        _backend_probed = True
+    return _backend_choice
+
+
+def _probe_bwrap() -> str | None:
+    """Whether bwrap can enter a real sandbox here (it needs user namespaces)."""
+    if not _BWRAP or not _STRACE:
+        return None
+    true_bin = shutil.which("true") or "/bin/true"
+    try:
+        proc = subprocess.run(
+            [*_bwrap_base_argv(), "--", true_bin],
+            capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return "bwrap" if proc.returncode == 0 else None
+
+
+def _bwrap_env(repo_root: str, scratch: str) -> dict[str, str]:
+    """Contained env: HOME/TMPDIR/scratch var point inside the writable scratch.
+
+    The ambient HOME (possibly the real host home) is never bound into the
+    sandbox, so it would resolve to nothing there; pointing HOME at the
+    scratch dir keeps it usable without exposing host home-directory content.
+    """
+    env = _directive_env(repo_root)
+    env["HOME"] = scratch
+    env["TMPDIR"] = scratch
+    env["AC_DIRECTIVE_SCRATCH"] = scratch
+    return env
+
+
+# -- containment (P4): tamper-resistant denial detection ---------------------
+#
+# Denials are read from a strace syscall log, not the child's own
+# stdout/stderr: the child can suppress its own error text (``2>/dev/null``)
+# or print misleading text ("permission denied" as ordinary output), but it
+# cannot edit a trace file it never has a path to and that lives outside
+# every path bound into its sandbox.
+#
+# ponytail: only ``AT_FDCWD``-relative opens/creates are resolved; opens
+# through an already-open directory fd (``openat(fd, ...)`` with fd not
+# ``AT_FDCWD``) are not classified into a denial EVENT. Containment itself
+# does not depend on this — the read-only mount blocks all of them at the
+# kernel level regardless — only the R3 diagnostic may under-report which
+# specific syscall was denied.
+# ponytail: a synchronous ``connect()`` failure (``ENETUNREACH`` etc, no
+# routable interface in the ``--unshare-net`` namespace) is what gets
+# classified; an async EINPROGRESS resolved later via poll/getsockopt is not
+# traced, but with zero configured interfaces the kernel rejects the connect
+# call itself rather than deferring it.
+#
+# Relative paths in a denial are resolved against the *calling PID's* actual
+# cwd, not a fixed initial directory: ``chdir`` is traced per-PID, and a
+# forked child (``clone``/``fork``/``vfork``) inherits its parent's cwd at
+# fork time, matching real process semantics (A4).
+
+_RE_CONNECT: Final = re.compile(rb"^\d+\s+connect\(.*\)\s*=\s*-1\s+(E\w+)")
+_RE_OPENAT: Final = re.compile(
+    rb'^(\d+)\s+openat\(AT_FDCWD,\s*"((?:[^"\\]|\\.)*)",\s*([^)]*)\)\s*=\s*-1\s+(E\w+)'
+)
+_RE_OPEN: Final = re.compile(
+    rb'^(\d+)\s+open\("((?:[^"\\]|\\.)*)",\s*([^)]*)\)\s*=\s*-1\s+(E\w+)'
+)
+_RE_CREAT: Final = re.compile(
+    rb'^(\d+)\s+creat\("((?:[^"\\]|\\.)*)",\s*[^)]*\)\s*=\s*-1\s+(E\w+)'
+)
+_RE_CHDIR: Final = re.compile(rb'^(\d+)\s+chdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*0')
+_RE_SPAWN: Final = re.compile(rb"^(\d+)\s+(?:clone3?|v?fork)\(.*\)\s*=\s*(\d+)\s*$")
+# Homogeneous (pid, path, errno) mutating-syscall denials: the write target
+# is the LAST quoted path in the call (the destination for rename*/symlink*).
+_RE_WRITE_SYSCALLS: Final = tuple(
+    re.compile(pattern) for pattern in (
+        rb'^(\d+)\s+mkdir\("((?:[^"\\]|\\.)*)",\s*[^)]*\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+mkdirat\(AT_FDCWD,\s*"((?:[^"\\]|\\.)*)",\s*[^)]*\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+unlink\("((?:[^"\\]|\\.)*)"\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+unlinkat\(AT_FDCWD,\s*"((?:[^"\\]|\\.)*)",\s*[^)]*\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+rmdir\("((?:[^"\\]|\\.)*)"\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+rename\("(?:[^"\\]|\\.)*",\s*"((?:[^"\\]|\\.)*)"\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+renameat2?\(AT_FDCWD,\s*"(?:[^"\\]|\\.)*",\s*'
+        rb'AT_FDCWD,\s*"((?:[^"\\]|\\.)*)"(?:,\s*[^)]*)?\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+symlink\("(?:[^"\\]|\\.)*",\s*"((?:[^"\\]|\\.)*)"\)\s*=\s*-1\s+(E\w+)',
+        rb'^(\d+)\s+symlinkat\("(?:[^"\\]|\\.)*",\s*AT_FDCWD,\s*'
+        rb'"((?:[^"\\]|\\.)*)"\)\s*=\s*-1\s+(E\w+)',
+    )
+)
+# Traced syscall names for the strace ``-e trace=`` filter: kept in sync with
+# the regexes above (plus ``chdir``/``clone``/``fork``/``vfork`` for cwd
+# tracking) so nothing here is parsed but never captured in the log.
+_TRACED_SYSCALLS: Final = (
+    "connect,openat,open,creat,chdir,clone,clone3,fork,vfork,"
+    "mkdir,mkdirat,unlink,unlinkat,rmdir,rename,renameat,renameat2,"
+    "symlink,symlinkat"
+)
+_WRITE_DENY_ERRNOS: Final = frozenset({"EROFS", "EACCES", "EPERM"})
+# Order matters: the bare backslash unescape must run LAST, else it would
+# partially consume the multi-char escapes it should leave intact.
+_STRACE_ESCAPES: Final = (
+    (b'\\"', b'"'), (b"\\n", b"\n"), (b"\\t", b"\t"), (b"\\r", b"\r"),
+    (b"\\\\", b"\\"),
+)
+_MAX_TRACE_BYTES: Final = 4 * 1024 * 1024
+
+
+def _unescape_strace_path(raw: bytes) -> str:
+    for esc, lit in _STRACE_ESCAPES:
+        raw = raw.replace(esc, lit)
+    return raw.decode("utf-8", "replace")
+
+
+def _record_write_denial(
+    events: list[dict[str, object]], path_raw: bytes, cwd: str,
+    write_roots: tuple[str, ...], errno: str,
+) -> None:
+    path = _unescape_strace_path(path_raw)
+    resolved = path if path.startswith("/") else os.path.normpath(os.path.join(cwd, path))
+    if not any(resolved == root or resolved.startswith(root + os.sep) for root in write_roots):
+        events.append({"event": "write_denied", "path": resolved, "errno": errno})
+
+
+def _parse_strace_denials(
+    data: bytes, write_roots: tuple[str, ...], cwd: str,
+) -> list[dict[str, object]]:
+    """Classify a strace log's failed syscall lines into denial events.
+
+    *cwd* is only the STARTING directory of the traced process (the sandbox
+    entry point); relative paths are resolved against the per-PID cwd
+    tracked from ``chdir`` calls and propagated across ``clone``/``fork``,
+    falling back to *cwd* for a PID that never (directly or via an ancestor)
+    called ``chdir`` (A4).
+    """
+    events: list[dict[str, object]] = []
+    pid_cwd: dict[str, str] = {}
+    for line in data.split(b"\n"):
+        m = _RE_SPAWN.match(line)
+        if m:
+            parent_pid, child_pid = m.group(1).decode(), m.group(2).decode()
+            pid_cwd[child_pid] = pid_cwd.get(parent_pid, cwd)
+            continue
+        m = _RE_CHDIR.match(line)
+        if m:
+            pid = m.group(1).decode()
+            path = _unescape_strace_path(m.group(2))
+            base = pid_cwd.get(pid, cwd)
+            pid_cwd[pid] = path if path.startswith("/") else os.path.normpath(
+                os.path.join(base, path)
+            )
+            continue
+        m = _RE_CONNECT.match(line)
+        if m:
+            events.append({"event": "network_denied", "errno": m.group(1).decode()})
+            continue
+        m = _RE_OPENAT.match(line) or _RE_OPEN.match(line)
+        if m:
+            pid = m.group(1).decode()
+            path_raw, flags_raw, errno = m.group(2), m.group(3), m.group(4).decode()
+            flags = flags_raw.decode("utf-8", "replace")
+            if errno in _WRITE_DENY_ERRNOS and (
+                "O_WRONLY" in flags or "O_RDWR" in flags or "O_CREAT" in flags
+            ):
+                _record_write_denial(events, path_raw, pid_cwd.get(pid, cwd), write_roots, errno)
+            continue
+        m = _RE_CREAT.match(line)
+        if m:
+            pid, errno = m.group(1).decode(), m.group(3).decode()
+            if errno in _WRITE_DENY_ERRNOS:
+                _record_write_denial(events, m.group(2), pid_cwd.get(pid, cwd), write_roots, errno)
+            continue
+        for pattern in _RE_WRITE_SYSCALLS:
+            m = pattern.match(line)
+            if m:
+                pid, errno = m.group(1).decode(), m.group(3).decode()
+                if errno in _WRITE_DENY_ERRNOS:
+                    _record_write_denial(
+                        events, m.group(2), pid_cwd.get(pid, cwd), write_roots, errno,
+                    )
+                break
+    return events
+
+
+def _read_trace_denials(
+    trace_path: str, write_roots: tuple[str, ...], cwd: str,
+) -> list[dict[str, object]]:
+    try:
+        with open(trace_path, "rb") as handle:
+            data = handle.read(_MAX_TRACE_BYTES)
+    except OSError:
+        return []
+    return _parse_strace_denials(data, write_roots, cwd)
+
+
+def _bwrap_contain(command: bytes, repo_root: str, profile: Any, timeout: int):
+    """Run *command* in a bwrap sandbox, tracing it with strace for R3.
+
+    Returns a :class:`ContainedRun`, or None when the sandbox could not be
+    entered for THIS run (never masquerades a setup failure as the
+    directive's own exit code, A3) — the caller treats that as infrastructure
+    failure rather than executing at ambient privilege.
+    """
+    repo_root_abs = os.path.abspath(repo_root)
+    scratch = getattr(profile, "scratch_dir", None) or os.path.join(
+        tempfile.gettempdir(), f"ac-directive-scratch-{secrets.token_hex(4)}",
+    )
+    scratch_abs = os.path.abspath(scratch)
+    try:
+        os.makedirs(scratch_abs, exist_ok=True)
+    except OSError:
+        return None
+
+    # The trace log lives OUTSIDE any path bound into the sandbox (not under
+    # scratch, which the contained command itself can write to) so the
+    # contained process has no path from which to reach and tamper with it.
+    try:
+        trace_fd, trace_path = tempfile.mkstemp(prefix="ac-directive-strace-")
+        os.close(trace_fd)
+    except OSError:
+        shutil.rmtree(scratch_abs, ignore_errors=True)
+        return None
+
+    write_roots = tuple(sorted({repo_root_abs, scratch_abs}))
+    bwrap_argv = [
+        *_bwrap_base_argv(),
+        "--bind", repo_root_abs, repo_root_abs,
+        "--bind", scratch_abs, scratch_abs,
+        "--", _POSIX_SH,
+    ]
+    argv = [
+        _STRACE, "-f", "-e", f"trace={_TRACED_SYSCALLS}",
+        "-o", trace_path, "--", *bwrap_argv,
+    ]
+    try:
+        stdout, stderr, rc, timed_out, truncated, stdout_lines = _run_shell(
+            command, repo_root_abs, timeout,
+            argv=argv, env=_bwrap_env(repo_root_abs, scratch_abs),
+        )
+        stripped = stderr.lstrip()
+        if stripped.startswith(b"bwrap: ") or stripped.startswith(b"strace: "):
+            # The sandbox (or the tracer) never entered — an infrastructure
+            # failure, not the directive's own result (A3).
+            return None
+        output = _bound_output(stdout, stderr, truncated)
+        if timed_out or (rc is not None and rc < 0):
+            # A killed/interrupted run's partial trace is not evidence either
+            # way; report the interruption, not a denial guess.
+            denials: list[dict[str, object]] = []
+        else:
+            denials = _read_trace_denials(trace_path, write_roots, repo_root_abs)
+        return ContainedRun(
+            output=output, stdout=stdout, rc=rc, timed_out=timed_out,
+            stdout_lines=stdout_lines, denials=tuple(denials),
+        )
+    finally:
+        shutil.rmtree(scratch_abs, ignore_errors=True)
+        try:
+            os.remove(trace_path)
+        except OSError:
+            pass
+
+
+def _contain(command: bytes, repo_root: str, profile: Any, timeout: int):
+    """Execute *command* under *profile*'s containment.
+
+    Returns a :class:`ContainedRun`, or None when no backend can enforce the
+    profile (R2: fail as infrastructure, never run at ambient). Inject this
+    seam to drive denial recording deterministically in tests.
+    """
+    if profile is None:
+        return None
+    if _containment_backend() != "bwrap":
+        return None
+    return _bwrap_contain(command, repo_root, profile, timeout)
+
+
+def _infra_failure(result: dict[str, Any], message: str) -> dict[str, Any]:
+    """Mark *result* infrastructure failure so the owning phase cannot APPROVE."""
+    result["status"] = "fail"
+    result["infra"] = True
+    result["message"] = message
+    return result
+
+
 def run_directive(directive: "Directive", repo_root: str | Any) -> dict[str, Any]:
     """Execute one parsed *directive* in *repo_root* under fixed semantics.
 
-    Returns ``{id, status, command, timed_out, message, truncated_output}``:
+    Returns ``{id, status, command, timed_out, message, truncated_output,
+    infra, denials}``:
 
     * ``id`` — ``"{ac}:{kind}"``;
-    * ``status`` — ``"pass"`` or ``"fail"``;
+    * ``status`` — ``"pass"`` or ``"fail"`` (an infrastructure failure also
+      settles ``"fail"`` — it can never be mistaken for ``"pass"`` — with
+      ``infra`` True so a caller can tell the two apart, mirroring the
+      ``ok``/``infra`` split used by the other gates in this module);
     * ``timed_out`` — True only when the per-directive timeout fired (fail);
     * ``message`` — short human reason (exit code, ``timeout``, interruption,
-      grep present/absent, no-diff diff list);
-    * ``truncated_output`` — length-bounded stdout+stderr, marked if cut.
+      grep present/absent, no-diff diff list, containment/infra reason);
+    * ``truncated_output`` — length-bounded stdout+stderr, marked if cut;
+    * ``infra`` — True when the runtime could not provide or enforce the P1
+      constrained profile a shell/no-diff directive requires, so it was NOT
+      executed at ambient privilege (R1/R2) — the owning phase must not
+      settle APPROVE on this result (F4 safe-degradation);
+    * ``denials`` — containment denial events (blocked network attempt,
+      blocked out-of-scope write) recorded for shell/no-diff (R3). A
+      directive that attempted to escape its containment fails even if its
+      permitted remainder would otherwise have passed.
+
+    grep runs unconfined (inert pattern match, R1). shell/no-diff run under
+    the P1 constrained profile (read tree, no network, writes confined to the
+    worktree + ephemeral scratch); when that profile cannot be resolved or
+    enforced the result is an infrastructure failure (R1/R2).
 
     shell: ``expected`` int (default 0) -> exit code; str -> exact stdout.
     grep:  pattern over the named files (default all tracked); ``expected``
@@ -831,13 +1240,18 @@ def run_directive(directive: "Directive", repo_root: str | Any) -> dict[str, Any
         "timed_out": False,
         "message": "",
         "truncated_output": "",
+        "infra": False,
+        "denials": (),
     }
 
-    if directive.kind == "no-diff":
-        named = _named_files(repo_root, directive.files, include_literal=True)
-        before = _snapshot(repo_root, named)
-        output, _stdout, rc, timed_out, interrupt, _lines = _execute(
-            directive.command, repo_root, directive.timeout,
+    if directive.kind == "grep":
+        # grep is an inert pattern match over the named file set: it can only
+        # read the worktree, so it needs no confinement (R1).
+        command = _append_files(
+            directive.command, _named_files(repo_root, directive.files),
+        )
+        output, stdout, rc, timed_out, interrupt, stdout_lines = _execute(
+            command, repo_root, directive.timeout,
         )
         result["truncated_output"] = output
         if timed_out:
@@ -847,55 +1261,6 @@ def run_directive(directive: "Directive", repo_root: str | Any) -> dict[str, Any
         if interrupt:
             result["message"] = interrupt
             return result
-        if rc != 0:
-            result["message"] = f"command exited {rc}"
-            return result
-        changed = _diff_names(before, _snapshot(repo_root, named))
-        if changed:
-            result["message"] = "diff: " + ", ".join(changed[:20])
-            return result
-        result["status"] = "pass"
-        result["message"] = "no diff"
-        return result
-
-    if directive.kind == "grep":
-        command = _append_files(
-            directive.command, _named_files(repo_root, directive.files),
-        )
-    else:
-        command = directive.command
-
-    output, stdout, rc, timed_out, interrupt, stdout_lines = _execute(
-        command, repo_root, directive.timeout,
-    )
-    result["truncated_output"] = output
-    if timed_out:
-        result["timed_out"] = True
-        result["message"] = f"timeout after {directive.timeout}s"
-        return result
-    if interrupt:
-        result["message"] = interrupt
-        return result
-
-    if directive.kind == "shell":
-        exp = directive.expected
-        if exp is None:
-            ok = rc == 0
-            result["message"] = f"exit {rc}" if ok else f"exit {rc}, expected 0"
-        elif isinstance(exp, bool):
-            ok = False
-            result["message"] = "illegal expected"
-        elif isinstance(exp, int):
-            ok = rc == exp
-            result["message"] = f"exit {rc}" if ok else f"exit {rc}, expected {exp}"
-        else:  # str: expected is the required stdout (exact match)
-            stdout_text = stdout.decode("utf-8", "replace")
-            ok = stdout_text == exp
-            result["message"] = "stdout match" if ok else "stdout mismatch"
-        result["status"] = "pass" if ok else "fail"
-        return result
-
-    if directive.kind == "grep":
         present = rc == 0
         exp = directive.expected
         if exp is None:
@@ -933,7 +1298,81 @@ def run_directive(directive: "Directive", repo_root: str | Any) -> dict[str, Any
             result["message"] = f"grep error {rc}"
         return result
 
-    result["message"] = f"unknown kind: {directive.kind!r}"
+    if directive.kind not in ("shell", "no-diff"):
+        # Directive is constructible directly (frozen dataclass, no field
+        # validation); the parser only ever hands run_directive a validated
+        # kind, but a directly-constructed one is not routed through
+        # containment for a kind this engine does not recognize.
+        result["message"] = f"unknown kind: {directive.kind!r}"
+        return result
+
+    # shell and no-diff run arbitrary commands, so they are routed through the
+    # P1 constrained profile (read tree, no network, writes confined to the
+    # worktree + ephemeral scratch). When the runtime cannot provide or
+    # enforce that profile, the directive fails as infrastructure rather than
+    # executing at ambient privilege (R1/R2, F4 safe-degradation).
+    profile = _resolve_profile(repo_root)
+    if profile is None:
+        return _infra_failure(result, "no constrained execution profile available")
+
+    named: list[str] = []
+    before: dict[str, str | None] = {}
+    if directive.kind == "no-diff":
+        named = _named_files(repo_root, directive.files, include_literal=True)
+        before = _snapshot(repo_root, named)
+
+    contained = _contain(directive.command, repo_root, profile, directive.timeout)
+    if contained is None:
+        return _infra_failure(result, "containment backend unavailable")
+
+    result["denials"] = contained.denials
+    output, stdout, rc, timed_out = (
+        contained.output, contained.stdout, contained.rc, contained.timed_out,
+    )
+    interrupt = (
+        f"interrupted: {_signal_name(rc)}" if rc is not None and rc < 0 else None
+    )
+    result["truncated_output"] = output
+    if contained.denials:
+        # a directive that attempted to escape its containment cannot settle
+        # APPROVE even if the permitted remainder would otherwise have passed.
+        result["message"] = f"containment denied {len(contained.denials)} operation(s)"
+        return result
+    if timed_out:
+        result["timed_out"] = True
+        result["message"] = f"timeout after {directive.timeout}s"
+        return result
+    if interrupt:
+        result["message"] = interrupt
+        return result
+
+    if directive.kind == "no-diff":
+        if rc != 0:
+            result["message"] = f"command exited {rc}"
+            return result
+        changed = _diff_names(before, _snapshot(repo_root, named))
+        if changed:
+            result["message"] = "diff: " + ", ".join(changed[:20])
+            return result
+        result["status"] = "pass"
+        result["message"] = "no diff"
+        return result
+
+    exp = directive.expected
+    if exp is None:
+        ok = rc == 0
+        result["message"] = f"exit {rc}" if ok else f"exit {rc}, expected 0"
+    elif isinstance(exp, bool):
+        ok = False
+        result["message"] = "illegal expected"
+    elif isinstance(exp, int):
+        ok = rc == exp
+        result["message"] = f"exit {rc}" if ok else f"exit {rc}, expected {exp}"
+    else:  # str: expected is the required stdout (exact match)
+        stdout_text = stdout.decode("utf-8", "replace")
+        ok = stdout_text == exp
+        result["message"] = "stdout match" if ok else "stdout mismatch"
+    result["status"] = "pass" if ok else "fail"
     return result
 
 
@@ -997,6 +1436,26 @@ if __name__ == "__main__":
         "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.co",
     }
     full_env = {**os.environ, **env}
+
+    # ponytail: the self-check exercises execution semantics directly, so it
+    # installs containment seams that run shell/no-diff commands for real.
+    # The module default would infra-fail on any host without a usable
+    # sandbox backend (this dev shell included), which is the correct
+    # behavior per R2 but would make the self-check untestable everywhere.
+    def _demo_profile(_repo_root):
+        return True  # truthy profile; the demo containment below ignores it
+
+    def _demo_contain(command, repo_root, _profile, timeout):
+        stdout, stderr, rc, timed_out, truncated, lines = _run_shell(
+            command, repo_root, timeout,
+        )
+        return ContainedRun(
+            _bound_output(stdout, stderr, truncated), stdout, rc,
+            timed_out, lines, (),
+        )
+
+    _resolve_profile = _demo_profile
+    _contain = _demo_contain
 
     with tempfile.TemporaryDirectory() as repo:
         _sp.run(["git", "init", "-q"], cwd=repo, check=True, env=full_env)
