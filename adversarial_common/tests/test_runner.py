@@ -1127,3 +1127,68 @@ def test_worker_origin_only_marks_items_below_findings_key():
     assert "origin" not in payload[0]
     assert "origin" not in payload[1]
     assert payload[1]["result"]["findings"][0]["origin"] == "worker"
+
+
+def _init_contract_repo(root, files):
+    """Init a throwaway git repo at *root* with *files* committed (grep
+    directives enumerate tracked files, so the repo must exist)."""
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t.co",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t.co",
+    }
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, env=env)
+    for relpath, text in files.items():
+        (root / relpath).write_text(text)
+    subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "base"], cwd=root, check=True, env=env,
+    )
+
+
+def test_final_json_contains_ac_checks(tmp_path):
+    # R1/AC1: after a contract-gate run, final.json carries an ac_checks[]
+    # field whose ids and statuses match the gate's directive outcomes.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _init_contract_repo(repo, {"tracked.txt": "foo line\nno match here\n"})
+    spec_path = tmp_path / "spec.md"
+    spec_path.write_text(
+        "# Spec\n\n"
+        "## Acceptance criteria\n\n"
+        "- AC1: has foo\n"
+        "  ```ac-directive\n"
+        "  ac: AC1\n"
+        "  kind: grep\n"
+        "  command: grep foo tracked.txt\n"
+        "  ```\n"
+        "- AC2: has the target token\n"
+        "  ```ac-directive\n"
+        "  ac: AC2\n"
+        "  kind: grep\n"
+        "  command: grep missingtoken tracked.txt\n"
+        "  ```\n"
+    )
+
+    gate = gates.run_contract_gate(str(spec_path), str(repo))
+    assert gate["settle"] == "REJECT"
+
+    payload = runner.ensure_final_payload(
+        verdict="REJECT", ac_checks=gate,
+    )
+    final_path = tmp_path / "final.json"
+    final_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    reloaded = json.loads(final_path.read_text(encoding="utf-8"))
+    assert "ac_checks" in reloaded
+    checks = reloaded["ac_checks"]
+    assert [c["id"] for c in checks] == ["AC1:grep", "AC2:grep"]
+    assert {c["status"] for c in checks} == {"pass", "fail"}
+    by_id = {c["id"]: c for c in checks}
+    assert by_id["AC1:grep"]["status"] == "pass"
+    assert by_id["AC2:grep"]["status"] == "fail"
+    # R1 shape: exactly the five promised keys, nothing leaked from the gate.
+    assert all(set(c) == {"id", "status", "command", "timed_out", "message"} for c in checks)
+    assert all(c["command"] == "grep foo tracked.txt" or c["command"]
+               == "grep missingtoken tracked.txt" for c in checks)
+    assert all(c["timed_out"] is False for c in checks)

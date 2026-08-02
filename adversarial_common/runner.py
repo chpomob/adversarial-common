@@ -606,6 +606,7 @@ def ensure_final_payload(
     infrastructure=None,
     context=None,
     provider_history=_UNSET,
+    ac_checks=_UNSET,
     **extra,
 ):
     """Return a complete, JSON-serializable final payload without mutation."""
@@ -649,6 +650,11 @@ def ensure_final_payload(
                 if (normalized := _validated_provider_decision(item))
                 is not None
             ]
+    ac_source = ac_checks
+    if ac_source is _UNSET and "ac_checks" in result:
+        ac_source = result["ac_checks"]
+    if ac_source is not _UNSET:
+        result["ac_checks"] = _normalized_ac_checks(ac_source)
     result.update(extra)
 
     normalized = _policy_name(result["verdict"])
@@ -696,6 +702,74 @@ def _truthy_outcome(value):
     if isinstance(value, Mapping):
         return value.get("ok") is False or bool(value.get("error"))
     return bool(value)
+
+
+def _normalized_ac_checks(source):
+    """Project contract-gate (P5) results into the ac_checks[] shape (R1).
+
+    Accepts the full ``run_contract_gate`` result mapping (its ``directives``
+    are projected) or any sequence of directive mappings, and projects each to
+    ``{id, status, command, timed_out, message}`` — the exact shape final.json
+    promises. Directives carry more fields than this (truncated_output, infra,
+    denials); those are dropped so the gate's internal evidence stays out of
+    the payload.
+
+    A gate rejected solely for a malformed directive records it only in
+    ``failures``/``ac_status`` (its ``id`` is None, so it never reaches
+    ``directives``). Such a parse error is synthesized into a check here, or
+    R1's promise that ac_checks carry every failed acceptance check — its
+    status and diagnostic — would silently produce ``ac_checks: []``.
+    """
+    parse_failures = []
+    if isinstance(source, Mapping) and "directives" in source:
+        existing_ids = {
+            str(d.get("id", ""))
+            for d in source["directives"]
+            if isinstance(d, Mapping)
+        }
+        for failure in source.get("failures", ()):
+            if not isinstance(failure, Mapping):
+                continue
+            # A failing directive is already represented in ``directives``;
+            # only the parse errors (id is None / absent) need synthesizing.
+            if str(failure.get("id", "")) in existing_ids:
+                continue
+            parse_failures.append({
+                "id": str(failure.get("id") or ""),
+                "status": "fail",
+                "command": str(failure.get("command", "")),
+                "timed_out": bool(failure.get("timed_out", False)),
+                "message": str(
+                    failure.get("reason", failure.get("message", ""))
+                ),
+            })
+        source = source["directives"]
+    if isinstance(source, Mapping):
+        source = [source]
+    if isinstance(source, (str, bytes, bytearray)) or not isinstance(
+        source, (list, tuple)
+    ):
+        raise TypeError(
+            "ac_checks must be a contract-gate result, a directive, "
+            "or a sequence of directives"
+        )
+    checks = []
+    for item in source:
+        if isinstance(item, Mapping):
+            checks.append({
+                "id": str(item.get("id", "")),
+                "status": str(item.get("status", "")),
+                "command": str(item.get("command", "")),
+                "timed_out": bool(item.get("timed_out", False)),
+                "message": str(item.get("message", "")),
+            })
+        else:
+            checks.append({
+                "id": str(item), "status": "", "command": "",
+                "timed_out": False, "message": "",
+            })
+    checks.extend(parse_failures)
+    return checks
 
 
 def _ci_finding_facts(value):
