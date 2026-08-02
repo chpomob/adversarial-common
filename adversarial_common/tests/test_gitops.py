@@ -710,6 +710,191 @@ class TestWorktreeTransaction:
         assert wt_path not in wt_list
 
 
+def _setup_conflict(workdir):
+    """Build a repo where cherry-picking one ``feature`` commit onto ``main``
+    conflicts, while a later ``feature`` commit cherry-picks cleanly.
+
+    Returns ``(conflicting_sha, safe_sha, main_head_before_pick)``:
+
+    - *conflicting_sha*: edits the same line of ``f.txt`` that *main* also
+      edited, so applying it onto *main* conflicts.
+    - *safe_sha*: a later commit on ``feature`` that only adds ``g.txt``,
+      independent of ``f.txt`` — always applies cleanly onto *main*
+      regardless of ``f.txt``'s state, useful for exercising a retry that
+      must converge after a *conflicting_sha* attempt is aborted.
+    """
+    gitops.auto_init(workdir)
+    _write(workdir, "f.txt", "base\n")
+    gitops.commit_all(workdir, "base")
+    gitops.create_branch(workdir, "feature", "main")
+
+    gitops.checkout(workdir, "feature")
+    _write(workdir, "f.txt", "feature change\n")
+    gitops.commit_all(workdir, "feature change")
+    conflicting_sha = gitops.head_sha(workdir)
+
+    _write(workdir, "g.txt", "new file\n")
+    gitops.commit_all(workdir, "add g.txt")
+    safe_sha = gitops.head_sha(workdir)
+
+    gitops.checkout(workdir, "main")
+    _write(workdir, "f.txt", "main change\n")
+    gitops.commit_all(workdir, "main change")
+    main_head = gitops.head_sha(workdir)
+
+    return conflicting_sha, safe_sha, main_head
+
+
+class TestCherryPickTransaction:
+    """cherry_pick: apply + abort-on-failure as one transaction (P12)."""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_cherry_pick_transaction_atomic(self):
+        # AC1: apply fails (real conflict), abort runs and succeeds, leaving
+        # a clean state: no CHERRY_PICK_HEAD, HEAD/index restored.
+        conflicting_sha, _safe_sha, main_head = _setup_conflict(self.tmpdir)
+
+        state = {}
+        with pytest.raises(gitops.GitError, match="cherry-pick"):
+            gitops.cherry_pick(self.tmpdir, conflicting_sha, state=state)
+
+        _out, _err, rc = _git(
+            self.tmpdir, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"
+        )
+        assert rc != 0
+        assert gitops.head_sha(self.tmpdir) == main_head
+        status_out, _err, _rc = _git(self.tmpdir, "status", "--porcelain")
+        assert status_out == ""
+
+        assert "warnings" not in state
+        assert state["last_transaction"]["outcome"] == "failed"
+        assert state["last_transaction"]["rollback"] == "executed"
+
+    def test_cherry_pick_abort_failure_recoverable(self):
+        # AC2: abort fails (simulated), leaving mid-merge state (CHERRY_PICK_HEAD,
+        # branch) intact; a retry clears that leftover partial merge and
+        # re-enters apply logic, converging to a clean apply.
+        conflicting_sha, safe_sha, _main_head = _setup_conflict(self.tmpdir)
+
+        orig_run = gitops._run
+
+        def failing_abort(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+            if args[:2] == ["cherry-pick", "--abort"]:
+                return "", "simulated abort failure", 1
+            return orig_run(workdir, args, timeout=timeout)
+
+        gitops._run = failing_abort
+        state = {}
+        try:
+            with pytest.raises(gitops.GitError, match="cherry-pick"):
+                gitops.cherry_pick(self.tmpdir, conflicting_sha, state=state)
+        finally:
+            gitops._run = orig_run
+
+        # Mid-merge state left intact: partial merge and branch untouched.
+        _out, _err, rc = _git(
+            self.tmpdir, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"
+        )
+        assert rc == 0
+        assert gitops.get_current_branch(self.tmpdir) == "main"
+        assert gitops.branch_exists(self.tmpdir, "feature")
+
+        # Retry (abort no longer simulated-failing) with a non-conflicting
+        # commit: clears the stale partial merge, then re-enters apply logic
+        # and converges to a clean apply.
+        gitops.cherry_pick(self.tmpdir, safe_sha, state=state)
+
+        _out, _err, rc = _git(
+            self.tmpdir, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"
+        )
+        assert rc != 0
+        status_out, _err, _rc = _git(self.tmpdir, "status", "--porcelain")
+        assert status_out == ""
+        assert _read(self.tmpdir, "g.txt") == "new file\n"
+        assert state["last_transaction"]["outcome"] == "success"
+
+    def test_cherry_pick_abort_failure_warns(self):
+        # AC3: abort's non-zero exit is checked, not silently swallowed — a
+        # warning is appended to state["warnings"] instead.
+        conflicting_sha, _safe_sha, _main_head = _setup_conflict(self.tmpdir)
+
+        orig_run = gitops._run
+
+        def failing_abort(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+            if args[:2] == ["cherry-pick", "--abort"]:
+                return "", "simulated abort failure", 1
+            return orig_run(workdir, args, timeout=timeout)
+
+        gitops._run = failing_abort
+        state = {}
+        try:
+            with pytest.raises(gitops.GitError, match="cherry-pick"):
+                gitops.cherry_pick(self.tmpdir, conflicting_sha, state=state)
+        finally:
+            gitops._run = orig_run
+
+        assert len(state["warnings"]) == 1
+        assert "simulated abort failure" in state["warnings"][0]
+        assert state["last_transaction"]["outcome"] == "failed"
+        assert state["last_transaction"]["rollback"] == "error"
+
+    def test_cherry_pick_retry_raises_when_stale_merge_cannot_be_cleared(self):
+        # R1: if the first call's rollback abort fails AND the retry's own
+        # cleanup abort (clearing that same stale partial merge) also fails,
+        # the retry must not proceed to attempt the new apply against the
+        # unresolved index — that would just fail with an unrelated
+        # "already in progress" error and mask the real cause. Unlike
+        # test_cherry_pick_abort_failure_recoverable, _run stays patched
+        # (failing) across the retry so this failure mode is actually
+        # exercised instead of being reset away.
+        conflicting_sha, safe_sha, _main_head = _setup_conflict(self.tmpdir)
+
+        orig_run = gitops._run
+
+        def failing_abort(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+            if args[:2] == ["cherry-pick", "--abort"]:
+                return "", "simulated abort failure", 1
+            return orig_run(workdir, args, timeout=timeout)
+
+        gitops._run = failing_abort
+        try:
+            state = {}
+            with pytest.raises(gitops.GitError, match="cherry-pick"):
+                gitops.cherry_pick(self.tmpdir, conflicting_sha, state=state)
+
+            # Retry with the cleanup abort still failing: must raise about
+            # the cleanup failure itself, not silently attempt the apply.
+            retry_state = {}
+            with pytest.raises(
+                gitops.GitError, match="stale partial merge"
+            ):
+                gitops.cherry_pick(self.tmpdir, safe_sha, state=retry_state)
+
+            # The partial merge is still intact — neither call cleared it.
+            _out, _err, rc = _git(
+                self.tmpdir, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"
+            )
+            assert rc == 0
+        finally:
+            gitops._run = orig_run
+
+        # Now that the abort genuinely works again, a further retry
+        # converges to a clean apply, confirming the repo was never
+        # corrupted by the earlier fail-fast path.
+        gitops.cherry_pick(self.tmpdir, safe_sha, state={})
+        _out, _err, rc = _git(
+            self.tmpdir, "rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"
+        )
+        assert rc != 0
+        status_out, _err, _rc = _git(self.tmpdir, "status", "--porcelain")
+        assert status_out == ""
+
+
 class TestRunTransaction:
     """run_transaction: atomic step execution with rollback + transaction log."""
 

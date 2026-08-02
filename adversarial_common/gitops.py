@@ -655,18 +655,89 @@ def teardown_worktree(repo, path, branch, *, state=None):
     return log, outcome
 
 
-def cherry_pick(workdir, commit_ref):
+def cherry_pick(workdir, commit_ref, *, state=None):
     """Cherry-pick *commit_ref* into the current branch in *workdir*.
 
-    Raises :class:`GitError` on conflict. The index is left clean (``cherry-pick
-    --abort`` has been run) before the exception is raised.
+    Raises :class:`GitError` on conflict (the original apply failure, never a
+    subsequent rollback-abort failure) or, on retry, if the leftover partial
+    merge from a prior failed abort cannot itself be cleared. Apply and
+    abort-on-failure run as a single :func:`run_transaction` (the
+    atomic-transaction helper used throughout this module): apply is the
+    sole step, ``git cherry-pick --abort`` is its rollback.
+
+    - apply fails, abort succeeds: no ``CHERRY_PICK_HEAD`` remains and
+      HEAD/index are restored to their pre-apply state before the original
+      apply failure is raised.
+    - apply fails, abort *also* fails: raising the abort failure here would
+      mask the original apply failure, which is still what gets raised.
+      Instead, per R2, the abort's non-zero exit is checked and a warning is
+      appended to ``state["warnings"]`` rather than silently swallowed. The
+      mid-merge state (``CHERRY_PICK_HEAD``, partial index, branch) is left
+      intact and inspectable. Calling :func:`cherry_pick` again against the
+      same *workdir* first clears that leftover partial merge (its own
+      ``cherry-pick --abort``) before re-attempting the apply, so retrying
+      from this state converges to a clean apply instead of failing forever
+      with "cherry-pick is already in progress". Per R1, that cleanup
+      abort's exit code is checked too: if it fails again, retrying would
+      otherwise attempt the new apply against the still-unresolved index,
+      fail with an unrelated "already in progress" error, and mask the real
+      cause — so this raises a :class:`GitError` immediately instead, naming
+      the cleanup failure, and leaves the partial merge intact for the next
+      retry.
+
+    *state*, if given, receives the transaction log/outcome the same way
+    :func:`run_transaction` always records them (``state["transactions"]``
+    / ``state["last_transaction"]``), plus any abort-failure warning
+    appended to ``state["warnings"]``.
     """
-    out, err, rc = _run(workdir, ["cherry-pick", commit_ref])
-    if rc != 0:
-        detail = (err or out).strip()
-        # Clean up: abort the cherry-pick so the index is not mid-merge.
-        _run(workdir, ["cherry-pick", "--abort"])
-        raise GitError(f"cherry-pick {commit_ref} failed: {detail}")
+    step_exc = {}
+
+    def _apply():
+        try:
+            _out, _err, rc = _run(
+                workdir, ["rev-parse", "-q", "--verify", "CHERRY_PICK_HEAD"]
+            )
+            if rc == 0:
+                # R1: a previous call's own abort may have failed, leaving a
+                # partial merge behind. Clear it so this attempt starts from
+                # a clean index instead of failing with "already in progress".
+                # If this cleanup abort itself fails, the stale merge is
+                # still there: proceeding to apply would just fail with an
+                # unrelated "already in progress" error and mask the real
+                # cause, so raise on the cleanup failure directly.
+                cleanup_out, cleanup_err, cleanup_rc = _run(
+                    workdir, ["cherry-pick", "--abort"]
+                )
+                if cleanup_rc != 0:
+                    detail = (cleanup_err or cleanup_out).strip()
+                    raise GitError(
+                        "cherry-pick --abort failed while clearing a stale "
+                        f"partial merge before retrying {commit_ref}: {detail}"
+                    )
+            _git(workdir, ["cherry-pick", commit_ref])
+        except BaseException as exc:
+            step_exc["exc"] = exc
+            raise
+
+    def _abort():
+        out, err, rc = _run(workdir, ["cherry-pick", "--abort"])
+        if rc != 0:
+            detail = (err or out).strip()
+            raise GitError(f"cherry-pick --abort failed: {detail}")
+
+    with transaction_scope(workdir):
+        log, outcome = run_transaction(
+            [_apply], _abort, label="cherry_pick", state=state
+        )
+
+    if outcome.get("rollback") == "error" and state is not None:
+        state.setdefault("warnings", []).append(
+            f"cherry-pick --abort failed after {commit_ref} apply failure: "
+            f"{log[-1]['detail']}"
+        )
+
+    if "exc" in step_exc:
+        raise step_exc["exc"]
 
 
 # --- atomic transactions ----------------------------------------------------
