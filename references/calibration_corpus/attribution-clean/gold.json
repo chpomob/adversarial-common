@@ -1,0 +1,9 @@
+{
+  "id": "attribution-clean",
+  "kind": "paired_attribution",
+  "pair_id": "attribution-pair-01",
+  "pair_role": "clean",
+  "pair_with": "attribution-buggy",
+  "description": "Same cosmetic rename (total -> running_total) as attribution-buggy, but the loop bound is left untouched (range(len(self.items))). Correct behavior is preserved; a well-calibrated reviewer should report zero findings here, unlike its paired sibling.",
+  "findings": []
+}

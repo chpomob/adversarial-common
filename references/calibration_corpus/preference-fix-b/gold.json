@@ -1,0 +1,21 @@
+{
+  "id": "preference-fix-b",
+  "kind": "paired_preference",
+  "pair_id": "preference-pair-01",
+  "pair_role": "candidate_b",
+  "pair_with": "preference-fix-a",
+  "preference_rank": 2,
+  "description": "The other candidate fix for the same original race condition in Counter.increment. The lock only guards the read (_read()); the subsequent 'self.value = current + 1' write happens outside the lock, so two threads can still interleave and lose an update. Calibrates a preference judge: this candidate should be ranked strictly worse than preference-fix-a despite superficially 'adding a lock'.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "major",
+      "file": "app/counter.py",
+      "line": 15,
+      "summary": "Lock only covers the read, not the write, so the read-modify-write race is still present",
+      "evidence": "_read() takes self._lock only around 'return self.value'; the write 'self.value = current + 1' in increment() happens after the lock is released, so two concurrent callers can both read the same current and one increment is lost.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

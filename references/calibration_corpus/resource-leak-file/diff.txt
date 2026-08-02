@@ -1,0 +1,13 @@
+diff --git a/app/batch.py b/app/batch.py
+index 7777777..8888888 100644
+--- a/app/batch.py
++++ b/app/batch.py
+@@ -5,4 +5,6 @@ def merge_logs(paths, out_path):
+     with open(out_path, "w") as out:
+         for path in paths:
+-            with open(path) as f:
+-                out.write(f.read())
++            f = open(path)
++            out.write(f.read())
++            if f.tell() == 0:
++                continue

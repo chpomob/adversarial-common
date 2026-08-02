@@ -1,0 +1,19 @@
+diff --git a/app/tree.py b/app/tree.py
+index ddddddd..eeeeeee 100644
+--- a/app/tree.py
++++ b/app/tree.py
+@@ -1,12 +1,7 @@
+-def flatten(node, out=None, seen=None):
++def flatten(node, out=None):
+     if out is None:
+         out = []
+-    if seen is None:
+-        seen = set()
+-    if id(node) in seen:
+-        return out
+-    seen.add(id(node))
+     out.append(node["value"])
+     for child in node.get("children", []):
+-        flatten(child, out, seen)
++        flatten(child, out)
+     return out

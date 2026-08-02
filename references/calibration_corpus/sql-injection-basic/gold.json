@@ -1,0 +1,18 @@
+{
+  "id": "sql-injection-basic",
+  "kind": "standard",
+  "description": "Replaces a parameterized query with an f-string that interpolates untrusted username input directly into SQL.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "app/db.py",
+      "line": 9,
+      "summary": "SQL injection via f-string interpolation of the username parameter",
+      "evidence": "The parameterized query 'WHERE username = ?' with a bound (username,) tuple was replaced by an f-string that splices username directly into the SQL text, e.g. username=\"' OR '1'='1\" alters the query.",
+      "category": "security",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

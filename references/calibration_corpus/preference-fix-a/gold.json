@@ -1,0 +1,10 @@
+{
+  "id": "preference-fix-a",
+  "kind": "paired_preference",
+  "pair_id": "preference-pair-01",
+  "pair_role": "candidate_a",
+  "pair_with": "preference-fix-b",
+  "preference_rank": 1,
+  "description": "One of two candidate fixes for the same original race condition in Counter.increment (unsynchronized read-modify-write on self.value under concurrent callers). This candidate wraps the full read-modify-write critical section in a threading.Lock, closing the race entirely. Calibrates a preference judge: this candidate should be ranked strictly better than preference-fix-b.",
+  "findings": []
+}

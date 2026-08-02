@@ -1,0 +1,18 @@
+{
+  "id": "hardcoded-secret",
+  "kind": "standard",
+  "description": "Replaces an environment-sourced API key with a hardcoded literal committed to source.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "app/client.py",
+      "line": 3,
+      "summary": "Live-looking API key hardcoded as a module-level constant instead of read from the environment",
+      "evidence": "os.environ[\"BILLING_API_KEY\"] was replaced by a literal API_KEY = \"sk_live_...\" committed directly to app/client.py, exposing the secret to anyone with repo access and to version control history.",
+      "category": "security",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

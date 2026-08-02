@@ -1,0 +1,14 @@
+diff --git a/app/client.py b/app/client.py
+index 5555555..6666666 100644
+--- a/app/client.py
++++ b/app/client.py
+@@ -1,7 +1,7 @@
+ import requests
+
++API_KEY = "sk_live_51Hc9F2example0000000000000000000000"
+
+ def fetch_billing(account_id):
+-    api_key = os.environ["BILLING_API_KEY"]
+-    headers = {"Authorization": f"Bearer {api_key}"}
++    headers = {"Authorization": f"Bearer {API_KEY}"}
+     return requests.get(f"https://billing.internal/accounts/{account_id}", headers=headers)

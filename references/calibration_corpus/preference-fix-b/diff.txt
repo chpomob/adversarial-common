@@ -1,0 +1,23 @@
+diff --git a/app/counter.py b/app/counter.py
+index 5e2a1c0..7c9d2e4 100644
+--- a/app/counter.py
++++ b/app/counter.py
+@@ -1,7 +1,16 @@
++import threading
++
++
+ class Counter:
+     def __init__(self):
+         self.value = 0
++        self._lock = threading.Lock()
++
++    def _read(self):
++        with self._lock:
++            return self.value
+
+     def increment(self):
+-        self.value = self.value + 1
+-        return self.value
++        current = self._read()
++        self.value = current + 1
++        return self.value

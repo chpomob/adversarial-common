@@ -1,0 +1,17 @@
+{
+  "id": "resource-leak-file",
+  "kind": "standard",
+  "description": "Replaces a 'with open(path) as f' context manager with a bare open() call that is never closed, inside a per-item loop.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "minor",
+      "file": "app/batch.py",
+      "line": 7,
+      "summary": "File handle opened per loop iteration is never closed, leaking descriptors for large path lists",
+      "evidence": "'with open(path) as f' was replaced by 'f = open(path)' with no matching close() or context manager; each iteration of the paths loop leaks one open file descriptor.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "id": "unbounded-recursion",
+  "kind": "standard",
+  "description": "Removes the 'seen' cycle-detection set from a recursive tree flattener, so a node graph containing a cycle (e.g. attacker-supplied JSON with a self-referential 'children' entry) recurses without bound instead of terminating.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "major",
+      "file": "app/tree.py",
+      "line": 1,
+      "summary": "Removing cycle detection makes flatten() recurse without bound on cyclic input",
+      "evidence": "The seen=set()/id(node) guard that stopped revisiting an already-flattened node was deleted; if node.get(\"children\", []) ever forms a cycle (directly or indirectly attacker-controlled), flatten() recurses indefinitely until the process hits RecursionError or crashes.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

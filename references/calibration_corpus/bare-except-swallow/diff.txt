@@ -1,0 +1,12 @@
+diff --git a/app/worker.py b/app/worker.py
+index 9999999..aaaaaaa 100644
+--- a/app/worker.py
++++ b/app/worker.py
+@@ -18,2 +18,5 @@ def process_job(job):
+-    result = handlers[job.kind](job.payload)
+-    return result
++    try:
++        result = handlers[job.kind](job.payload)
++        return result
++    except:
++        pass

@@ -1,0 +1,18 @@
+{
+  "id": "path-traversal-download",
+  "kind": "standard",
+  "description": "Removes the os.path.basename() sanitization before joining a caller-controlled filename into the upload root path.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "app/files.py",
+      "line": 14,
+      "summary": "Path traversal: unsanitized filename joined directly into UPLOAD_ROOT",
+      "evidence": "os.path.basename(filename) was dropped, so filename=\"../../etc/passwd\" reaches os.path.join(UPLOAD_ROOT, filename) and open() unchanged, escaping the upload root.",
+      "category": "security",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+diff --git a/app/convert.py b/app/convert.py
+index fffffff..0101010 100644
+--- a/app/convert.py
++++ b/app/convert.py
+@@ -1,7 +1,5 @@
+ import subprocess
+
+ def to_pdf(input_path, output_path):
+-    subprocess.run(
+-        ["soffice", "--headless", "--convert-to", "pdf", "--outdir", output_path, input_path],
+-        check=True,
+-    )
++    cmd = f"soffice --headless --convert-to pdf --outdir {output_path} {input_path}"
++    subprocess.run(cmd, shell=True, check=True)

@@ -1,0 +1,20 @@
+{
+  "id": "attribution-buggy",
+  "kind": "paired_attribution",
+  "pair_id": "attribution-pair-01",
+  "pair_role": "buggy",
+  "pair_with": "attribution-clean",
+  "description": "Bundles a harmless variable rename (total -> running_total) together with a real off-by-one bug (range(len(items)) -> range(len(items) - 1)) in the same hunk. Calibrates whether the reviewer attributes the finding to the actual defect line rather than the cosmetic rename, and whether it correctly abstains on the sibling clean diff.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "app/inventory.py",
+      "line": 18,
+      "summary": "Off-by-one loop bound drops the last item from the total price computation",
+      "evidence": "range(len(self.items)) was narrowed to range(len(self.items) - 1), so total_price() silently omits the final item in self.items.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

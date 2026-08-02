@@ -1,0 +1,12 @@
+diff --git a/app/cache.py b/app/cache.py
+index bbbbbbb..ccccccc 100644
+--- a/app/cache.py
++++ b/app/cache.py
+@@ -1,6 +1,4 @@
+-def get_or_compute(key, compute, cache=None):
+-    if cache is None:
+-        cache = {}
++def get_or_compute(key, compute, cache={}):
+     if key not in cache:
+         cache[key] = compute(key)
+     return cache[key]

@@ -1,0 +1,18 @@
+{
+  "id": "command-injection-shell",
+  "kind": "standard",
+  "description": "Replaces an argv-list subprocess.run() call with shell=True over an f-string that interpolates caller-controlled input_path/output_path unescaped.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "blocker",
+      "file": "app/convert.py",
+      "line": 5,
+      "summary": "Shell command injection via unescaped path interpolation with shell=True",
+      "evidence": "The safe argv-list form of subprocess.run([...], check=True) was replaced by subprocess.run(cmd, shell=True, check=True) where cmd is an f-string splicing input_path/output_path directly; a path like '; rm -rf / #' or containing spaces/metacharacters executes arbitrary shell commands.",
+      "category": "security",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

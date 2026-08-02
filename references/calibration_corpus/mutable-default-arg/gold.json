@@ -1,0 +1,17 @@
+{
+  "id": "mutable-default-arg",
+  "kind": "standard",
+  "description": "Replaces the 'cache=None' sentinel-and-init pattern with a mutable default argument 'cache={}', which is evaluated once and shared across every call site that omits the parameter.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "major",
+      "file": "app/cache.py",
+      "line": 1,
+      "summary": "Mutable default argument cache={} is shared across all calls that omit it",
+      "evidence": "The 'cache=None' plus 'if cache is None: cache = {}' guard was removed in favor of 'cache={}' as the default; Python evaluates default arguments once at def time, so every caller relying on the default now shares and mutates the same dict across calls.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}

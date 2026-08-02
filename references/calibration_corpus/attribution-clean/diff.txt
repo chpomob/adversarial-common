@@ -1,0 +1,18 @@
+diff --git a/app/inventory.py b/app/inventory.py
+index 7c1a2b3..4d8e1f2 100644
+--- a/app/inventory.py
++++ b/app/inventory.py
+@@ -14,10 +14,10 @@ class Inventory:
+         self.items = items
+
+     def total_price(self):
+-        total = 0
++        running_total = 0
+         for i in range(len(self.items)):
+-            total += self.items[i]["price"] * self.items[i]["qty"]
+-        return total
++            running_total += self.items[i]["price"] * self.items[i]["qty"]
++        return running_total
+
+     def item_count(self):
+         return len(self.items)

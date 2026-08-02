@@ -1,0 +1,17 @@
+{
+  "id": "bare-except-swallow",
+  "kind": "standard",
+  "description": "Wraps a job handler dispatch in a bare 'except: pass' that swallows every error, including KeyError from an unknown job.kind and any handler exception, and returns None silently instead of the result.",
+  "findings": [
+    {
+      "id": "F1",
+      "severity": "major",
+      "file": "app/worker.py",
+      "line": 21,
+      "summary": "Bare except swallows all exceptions and silently drops the job result",
+      "evidence": "'except:' with a bare 'pass' catches every exception (including KeyError for an unregistered job.kind), discards it with no logging, and falls through returning None instead of propagating the failure or the handler's result.",
+      "confidence": "high",
+      "basis": "code"
+    }
+  ]
+}
