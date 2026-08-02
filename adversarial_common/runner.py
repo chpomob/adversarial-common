@@ -528,6 +528,9 @@ def ci_exit_code(
         infrastructure = infrastructure or _truthy_outcome(
             payload.get("infrastructure")
         )
+        infrastructure = infrastructure or _integration_gate_failed(
+            payload.get("integration_gate")
+        )
         context_blocked = context_blocked or _truthy_outcome(
             payload.get("context_blocked")
         )
@@ -607,6 +610,7 @@ def ensure_final_payload(
     context=None,
     provider_history=_UNSET,
     ac_checks=_UNSET,
+    integration_gate=_UNSET,
     **extra,
 ):
     """Return a complete, JSON-serializable final payload without mutation."""
@@ -655,6 +659,11 @@ def ensure_final_payload(
         ac_source = result["ac_checks"]
     if ac_source is not _UNSET:
         result["ac_checks"] = _normalized_ac_checks(ac_source)
+    gate_source = integration_gate
+    if gate_source is _UNSET and "integration_gate" in result:
+        gate_source = result["integration_gate"]
+    if gate_source is not _UNSET:
+        result["integration_gate"] = _normalized_integration_gate(gate_source)
     result.update(extra)
 
     normalized = _policy_name(result["verdict"])
@@ -674,6 +683,7 @@ def ensure_final_payload(
     is_infra = (
         normalized in _CI_INFRA_VERDICTS
         or _truthy_outcome(result.get("infrastructure"))
+        or _integration_gate_failed(result.get("integration_gate"))
         or normalized not in known_verdicts
     )
     if is_context_block:
@@ -770,6 +780,42 @@ def _normalized_ac_checks(source):
             })
     checks.extend(parse_failures)
     return checks
+
+
+def _normalized_integration_gate(source):
+    """Project a P16 integration-gate result into the final.json contract.
+
+    Only ``{per_repo, gate_passed, gate_duration_s}`` are promised; other
+    fields a caller's gate result may carry (manifest paths, raw entries) are
+    dropped so the public artifact stays stable regardless of the gate
+    runner's internals.
+    """
+    if not isinstance(source, Mapping):
+        raise TypeError("integration_gate must be a mapping")
+    per_repo = source.get("per_repo", [])
+    if not isinstance(per_repo, Sequence) or isinstance(
+        per_repo, (str, bytes, bytearray)
+    ):
+        raise TypeError("integration_gate per_repo must be a sequence")
+    return {
+        "per_repo": [
+            dict(item) if isinstance(item, Mapping) else item
+            for item in per_repo
+        ],
+        "gate_passed": bool(source.get("gate_passed")),
+        "gate_duration_s": source.get("gate_duration_s"),
+    }
+
+
+def _integration_gate_failed(value):
+    """True when a payload's ``integration_gate`` records a failed run.
+
+    A gate failure is infrastructure, not a code-quality rejection (R1,
+    P16): the cross-repo test run itself could not be verified clean, so it
+    must route final.json/CI exit codes through the infrastructure path
+    rather than REJECT/blocking.
+    """
+    return isinstance(value, Mapping) and value.get("gate_passed") is False
 
 
 def _ci_finding_facts(value):
