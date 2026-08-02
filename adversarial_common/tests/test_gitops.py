@@ -563,6 +563,152 @@ class TestGitOps:
             content = fh.read()
         assert content.count("*.log") == 1
 
+    def test_remove_worktree_raises_on_real_failure(self, monkeypatch):
+        # R2/AC2: a genuine git failure (not the already-gone case, excluded
+        # by remove_worktree's existence check) must raise GitError instead
+        # of being swallowed.
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        wt_path = os.path.join(self.tmpdir, "wt")
+        gitops.create_worktree(self.tmpdir, wt_path, "HEAD")
+
+        def fake_run(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+            return "", "fatal: simulated worktree remove failure", 1
+
+        monkeypatch.setattr(gitops, "_run", fake_run)
+        with pytest.raises(gitops.GitError, match="simulated worktree remove failure"):
+            gitops.remove_worktree(self.tmpdir, wt_path)
+
+
+class TestWorktreeTransaction:
+    """teardown_worktree: remove -> delete branch -> prune as one transaction."""
+
+    def setup_method(self):
+        self.tmpdir = tempfile.mkdtemp()
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _make_worktree(self, branch):
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        wt_path = os.path.join(self.tmpdir, "wt")
+        gitops.create_worktree(self.tmpdir, wt_path, "HEAD", branch_name=branch)
+        return wt_path
+
+    def test_worktree_transaction_atomic(self):
+        # AC1: remove fails -> worktree still present, branch intact, and
+        # the failure/rollback-skipped log is recorded; later steps
+        # (delete branch, prune) never run.
+        branch = "loop/atomic/1"
+        wt_path = self._make_worktree(branch)
+
+        orig_run = gitops._run
+
+        def failing_run(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+            if args[:2] == ["worktree", "remove"]:
+                return "", "simulated remove failure", 1
+            return orig_run(workdir, args, timeout=timeout)
+
+        gitops._run = failing_run
+        state = {}
+        try:
+            with pytest.raises(gitops.GitError, match="simulated remove failure"):
+                gitops.teardown_worktree(self.tmpdir, wt_path, branch, state=state)
+        finally:
+            gitops._run = orig_run
+
+        assert os.path.isdir(wt_path)
+        wt_list, _, _ = _git(self.tmpdir, "worktree", "list")
+        assert wt_path in wt_list
+        assert gitops.branch_exists(self.tmpdir, branch)
+
+        assert [entry["step"] for entry in state["transactions"]] == [
+            "_remove", "rollback",
+        ]
+        assert state["transactions"][0]["status"] == "failed"
+        assert state["transactions"][1] == {
+            "step": "rollback", "status": "skipped", "detail": "",
+        }
+        assert state["last_transaction"]["outcome"] == "failed"
+        assert state["last_transaction"]["failed_step"] == "_remove"
+        assert state["last_transaction"]["rollback"] == "skipped"
+
+    def test_remove_worktree_raises_on_real_failure_via_transaction(self):
+        # AC2 (transaction path): the same real-failure check applies when
+        # remove_worktree is driven through teardown_worktree.
+        branch = "loop/real-failure/1"
+        wt_path = self._make_worktree(branch)
+
+        orig_run = gitops._run
+
+        def failing_run(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+            if args[:2] == ["worktree", "remove"]:
+                return "", "fatal: simulated failure", 1
+            return orig_run(workdir, args, timeout=timeout)
+
+        gitops._run = failing_run
+        try:
+            with pytest.raises(gitops.GitError):
+                gitops.teardown_worktree(self.tmpdir, wt_path, branch)
+        finally:
+            gitops._run = orig_run
+
+    def test_worktree_transaction_retry_converges(self):
+        # AC3: a transient remove failure leaves the worktree and branch
+        # intact; retrying teardown_worktree once the failure clears
+        # converges to a fully clean state.
+        branch = "loop/retry/1"
+        wt_path = self._make_worktree(branch)
+
+        orig_run = gitops._run
+        fail_once = {"triggered": False}
+
+        def flaky_run(workdir, args, timeout=gitops.DEFAULT_GIT_TIMEOUT):
+            if args[:2] == ["worktree", "remove"] and not fail_once["triggered"]:
+                fail_once["triggered"] = True
+                return "", "simulated transient failure", 1
+            return orig_run(workdir, args, timeout=timeout)
+
+        gitops._run = flaky_run
+        try:
+            with pytest.raises(gitops.GitError, match="simulated transient failure"):
+                gitops.teardown_worktree(self.tmpdir, wt_path, branch)
+
+            assert os.path.isdir(wt_path)
+            assert gitops.branch_exists(self.tmpdir, branch)
+
+            # Retry after the transient failure clears.
+            gitops.teardown_worktree(self.tmpdir, wt_path, branch)
+        finally:
+            gitops._run = orig_run
+
+        assert not os.path.exists(wt_path)
+        assert not gitops.branch_exists(self.tmpdir, branch)
+
+    def test_worktree_transaction_converges_when_dir_deleted_out_of_band(self):
+        # A1: the worktree directory can go missing without git's metadata
+        # being updated (e.g. an out-of-band `shutil.rmtree`). remove_worktree
+        # must still recognize the registered-but-dirless worktree and remove
+        # it instead of silently no-op'ing, or delete_branch fails forever
+        # with "used by worktree" and retries never converge (R1).
+        branch = "loop/stale/1"
+        wt_path = self._make_worktree(branch)
+
+        shutil.rmtree(wt_path)
+
+        gitops.teardown_worktree(self.tmpdir, wt_path, branch)
+        assert not gitops.branch_exists(self.tmpdir, branch)
+        wt_list, _, _ = _git(self.tmpdir, "worktree", "list")
+        assert wt_path not in wt_list
+
+        # A retry (in case any user calls it twice) stays a clean no-op.
+        gitops.teardown_worktree(self.tmpdir, wt_path, branch)
+        wt_list, _, _ = _git(self.tmpdir, "worktree", "list")
+        assert wt_path not in wt_list
+
 
 class TestRunTransaction:
     """run_transaction: atomic step execution with rollback + transaction log."""

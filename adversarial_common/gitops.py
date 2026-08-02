@@ -547,15 +547,33 @@ def create_worktree(repo, path, base_ref, branch_name=None):
     _git(repo, args)
 
 
+def _registered_worktree_paths(repo):
+    """Return the resolved paths of every worktree *repo* currently knows about."""
+    out, err, rc = _run(repo, ["worktree", "list", "--porcelain"])
+    if rc != 0:
+        detail = (err or out).strip()
+        raise GitError(f"git worktree list --porcelain failed: {detail}")
+    paths = set()
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            paths.add(str(Path(line[len("worktree "):]).resolve()))
+    return paths
+
+
 def remove_worktree(repo, path):
     """Force-remove a worktree and prune its metadata.
 
-    No-op (not an error) when the worktree does not exist. Raises
-    :class:`GitError` on a genuine git failure (the already-gone case is
-    excluded by the existence check above).
+    No-op (not an error) when *path* is neither present on disk nor still
+    registered with git. A worktree directory that was deleted out-of-band
+    (``shutil.rmtree`` and friends) is *not* treated as already gone: git
+    still considers it to own its branch, so skipping the removal here would
+    leave a later ``delete_branch`` failing forever with "used by worktree"
+    (R1 requires teardown retries to converge). Checking the registration
+    (``git worktree list``) rather than only the filesystem path catches that
+    case. Raises :class:`GitError` on a genuine git failure.
     """
     p = Path(path)
-    if not p.exists():
+    if not p.exists() and str(p.resolve()) not in _registered_worktree_paths(repo):
         return
     out, err, rc = _run(repo, ["worktree", "remove", "--force", str(path)])
     if rc != 0:
@@ -570,6 +588,71 @@ def prune_worktrees(repo):
     longer exist. Idempotent and safe to call when nothing is stale.
     """
     _git(repo, ["worktree", "prune"])
+
+
+def teardown_worktree(repo, path, branch, *, state=None):
+    """Atomically tear down a loop worktree: remove -> delete branch -> prune.
+
+    Runs :func:`remove_worktree`, :func:`delete_branch`, and
+    :func:`prune_worktrees` as a single :func:`run_transaction` (the
+    atomic-transaction helper used throughout this module), with no
+    rollback callable. None is needed because each step already fails
+    closed onto a state that is both safe to leave as-is and safe to retry:
+
+    - remove failure: the worktree directory is untouched and still
+      recorded by git, so a retry re-attempts the same removal;
+    - branch delete failure (remove having already succeeded): the branch
+      is left intact, so a retry re-attempts the same delete;
+    - prune failure: stale ``.git/worktrees/<id>`` metadata is left behind,
+      but the repo stays usable and a later ``prune_worktrees`` call (this
+      one or any other) reconciles it.
+
+    Because all three underlying operations are idempotent (a no-op once
+    their target is already gone), simply calling :func:`teardown_worktree`
+    again after a partial failure converges to a fully clean state.
+
+    Unlike a bare :func:`run_transaction` call -- whose ordinary step
+    failures are recorded but not raised -- this always re-raises the
+    failing step's exception after the transaction log/outcome are
+    recorded, mirroring :func:`stash_dirty`, so a caller sees the failure
+    the same way a direct call to the underlying function would.
+
+    *state*, if given, receives the transaction log/outcome the same way
+    :func:`run_transaction` always records them (``state["transactions"]``
+    / ``state["last_transaction"]``).
+    """
+    step_exc = {}
+
+    def _remove():
+        try:
+            remove_worktree(repo, path)
+        except BaseException as exc:
+            step_exc["exc"] = exc
+            raise
+
+    def _delete_branch():
+        try:
+            delete_branch(repo, branch)
+        except BaseException as exc:
+            step_exc["exc"] = exc
+            raise
+
+    def _prune():
+        try:
+            prune_worktrees(repo)
+        except BaseException as exc:
+            step_exc["exc"] = exc
+            raise
+
+    with transaction_scope(repo):
+        log, outcome = run_transaction(
+            [_remove, _delete_branch, _prune], None,
+            label="teardown_worktree", state=state,
+        )
+
+    if "exc" in step_exc:
+        raise step_exc["exc"]
+    return log, outcome
 
 
 def cherry_pick(workdir, commit_ref):
