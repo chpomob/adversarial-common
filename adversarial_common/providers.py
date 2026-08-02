@@ -995,12 +995,13 @@ _FULL_PRIVILEGE_TOKENS: Final = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class SandboxMode:
-    """Resolved containment profile for a role (data only; it does not enforce).
+    """Resolved containment profile for a role (advisory metadata; it does NOT enforce).
 
-    The review role is read-only (``allow_write`` false) and no-network. Even so,
-    ``write_roots`` records the envelope any write must stay inside (repo worktree
-    + an ephemeral scratch dir) so the same profile can be reused by a containment
-    enforcer (P4/F1b) without re-deriving it. ``source``/``events`` carry the
+    This is a data record, not an OS-level security boundary. The review role
+    carries ``allow_write=False`` and ``no_network=True`` as guidance, but actual
+    enforcement depends on the provider CLI's own sandboxing. A provider can
+    still write or use the network if its CLI permits it. ``write_roots`` records
+    the envelope any write must stay inside (repo worktree + ephemeral scratch).
     diagnostics the caller can surface (R3).
     """
 
