@@ -8,6 +8,7 @@ orchestrator must never be imported back into this base.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -23,6 +24,23 @@ from .costs import CostLedger
 
 
 SETTLED_STATUSES = frozenset({"resolved", "rejected"})
+
+
+def _accepts_kwarg(func: Callable[..., Any], name: str) -> bool:
+    """True if *func* accepts keyword argument *name* (directly or via ``**kwargs``).
+
+    Used to probe optional-parameter support on injected adapters (e.g.
+    :attr:`GitSetupPolicy.git_adapter`) before passing a newer optional
+    keyword, so an adapter written against an older, narrower signature isn't
+    broken by a ``TypeError`` for an unexpected keyword.
+    """
+    try:
+        params = inspect.signature(func).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _stdout_report(message: str) -> None:
@@ -375,7 +393,18 @@ def setup_git(
     *,
     policy: GitSetupPolicy | None = None,
 ) -> dict[str, Any]:
-    """Prepare a pipeline branch while keeping stash recovery state current."""
+    """Prepare a pipeline branch while keeping stash recovery state current.
+
+    The stash push and the branch-creation sequence each run through
+    :func:`gitops.run_transaction` (the P9 atomic helper also used by
+    :func:`gitops.stash_dirty`, :func:`gitops.teardown_worktree`, and
+    :func:`gitops.cherry_pick`) rather than as bare, unlogged adapter calls.
+    Both transactions' logs land in ``target_state["transactions"]`` /
+    ``target_state["last_transaction"]`` — the same run-diagnostics surface
+    every other atomic git operation in this codebase reports through — so a
+    mid-setup failure is attributable to a specific step in ``state.json`` /
+    ``final.json`` instead of only the flattened ``error`` string below.
+    """
     selected = policy or GitSetupPolicy()
     target_state = state if state is not None else {}
     target_state.setdefault("stash_id", "")
@@ -412,18 +441,74 @@ def setup_git(
             # still leaves state holding a recoverable id for restore_git.
             target_state["stash_id"] = stash_id
 
-        target_state["stash_id"] = adapter.stash_dirty(
-            workdir, on_pushed=_record_stash_id,
-        )
-        branch = adapter.create_loop_branch(
-            workdir, feature, parent, prefix=selected.prefix,
-        )
-        target_state["branch"] = branch
-        adapter.checkout(workdir, branch)
-        branch_point = adapter.record_branch_point(workdir, parent)
-        target_state["branch_point"] = branch_point
+        # stash_dirty runs its own push+resolve run_transaction internally
+        # (label "stash_dirty"); passing target_state lets that log surface
+        # here instead of being discarded. state is an optional parameter on
+        # the built-in gitops.stash_dirty, but GitSetupPolicy.git_adapter is
+        # a public extension point — an injected adapter written against the
+        # older, narrower stash_dirty(workdir, *, on_pushed=None) signature
+        # must still work, so only pass state when the adapter declares it.
+        stash_kwargs: dict[str, Any] = {"on_pushed": _record_stash_id}
+        if _accepts_kwarg(adapter.stash_dirty, "state"):
+            stash_kwargs["state"] = target_state
+        target_state["stash_id"] = adapter.stash_dirty(workdir, **stash_kwargs)
+
+        branch_holder: dict[str, Any] = {}
+        step_exc: dict[str, BaseException] = {}
+
+        def _create_branch():
+            try:
+                branch_holder["branch"] = adapter.create_loop_branch(
+                    workdir, feature, parent, prefix=selected.prefix,
+                )
+                # Sync into target_state the instant the branch exists (same
+                # pattern as _record_stash_id above): a BaseException from a
+                # later step makes run_transaction re-raise past the copy
+                # that used to happen only after it returned, so recovery
+                # state must already hold the branch that really was created.
+                target_state["branch"] = branch_holder["branch"]
+            except BaseException as exc:
+                step_exc["exc"] = exc
+                raise
+
+        def _checkout_branch():
+            try:
+                adapter.checkout(workdir, branch_holder["branch"])
+            except BaseException as exc:
+                step_exc["exc"] = exc
+                raise
+
+        def _record_branch_point():
+            try:
+                branch_holder["branch_point"] = adapter.record_branch_point(
+                    workdir, parent,
+                )
+                target_state["branch_point"] = branch_holder["branch_point"]
+            except BaseException as exc:
+                step_exc["exc"] = exc
+                raise
+
+        def _apply_gitignore():
+            try:
+                adapter.ensure_gitignore(workdir, selected.gitignore_entry)
+            except BaseException as exc:
+                step_exc["exc"] = exc
+                raise
+
+        branch_steps = [_create_branch, _checkout_branch, _record_branch_point]
         if selected.gitignore_entry:
-            adapter.ensure_gitignore(workdir, selected.gitignore_entry)
+            branch_steps.append(_apply_gitignore)
+
+        with gitops.transaction_scope(workdir):
+            gitops.run_transaction(
+                branch_steps, None, label="git_setup_branch", state=target_state,
+            )
+
+        if "exc" in step_exc:
+            raise step_exc["exc"]
+
+        branch = branch_holder["branch"]
+        branch_point = branch_holder["branch_point"]
         return {
             "exit_code": 0,
             "parent_branch": parent,
@@ -468,7 +553,17 @@ def restore_git(
     *,
     policy: RestorePolicy | None = None,
 ) -> RestoreResult:
-    """Return to the parent branch, restore a stash, and persist cleared state."""
+    """Return to the parent branch, restore a stash, and persist cleared state.
+
+    The checkout and the stash pop run as steps of one
+    :func:`gitops.run_transaction` call (the P9 atomic helper) rather than as
+    bare adapter calls, with the log recorded into ``state["transactions"]`` /
+    ``state["last_transaction"]``. Because ``run_transaction`` stops at the
+    first failing step, a failed checkout still guarantees the stash pop is
+    never attempted — the same "never unstash after a failed checkout"
+    guarantee this function has always provided, now also observable in the
+    run diagnostics rather than only in the returned :class:`RestoreResult`.
+    """
     selected = policy or RestorePolicy()
     cleanup_error = ""
     context = {"workdir": workdir, "state": state, "out_dir": out_dir}
@@ -480,13 +575,35 @@ def restore_git(
             _safe_report(selected.reporter, f"! pre-restore cleanup failed: {exc}")
 
     parent = str(state.get("parent_branch", "") or "")
-    try:
-        if parent and selected.git_adapter.get_current_branch(workdir) != parent:
-            selected.git_adapter.checkout(workdir, parent)
-    except Exception as exc:
+    stash_id = str(state.get("stash_id", "") or "")
+    step_exc: dict[str, BaseException] = {}
+
+    def _checkout_parent():
+        try:
+            if parent and selected.git_adapter.get_current_branch(workdir) != parent:
+                selected.git_adapter.checkout(workdir, parent)
+        except BaseException as exc:
+            step_exc["checkout"] = exc
+            raise
+
+    def _unstash():
+        try:
+            selected.git_adapter.unstash(workdir, stash_id)
+        except BaseException as exc:
+            step_exc["unstash"] = exc
+            raise
+
+    steps = [_checkout_parent]
+    if stash_id:
+        steps.append(_unstash)
+
+    with gitops.transaction_scope(workdir):
+        gitops.run_transaction(steps, None, label="restore_git", state=state)
+
+    if "checkout" in step_exc:
+        exc = step_exc["checkout"]
         message = f"could not restore branch {parent!r}: {exc}"
         _safe_report(selected.reporter, f"! {message}")
-        stash_id = str(state.get("stash_id", "") or "")
         if stash_id:
             _safe_report(
                 selected.reporter,
@@ -495,12 +612,10 @@ def restore_git(
             )
         return RestoreResult(False, False, False, message, cleanup_error)
 
-    stash_id = str(state.get("stash_id", "") or "")
     if not stash_id:
         return RestoreResult(True, True, False, cleanup_error=cleanup_error)
-    try:
-        selected.git_adapter.unstash(workdir, stash_id)
-    except Exception as exc:
+    if "unstash" in step_exc:
+        exc = step_exc["unstash"]
         message = f"could not pop {stash_id}: {exc}"
         _safe_report(selected.reporter, f"! {message}")
         return RestoreResult(True, False, False, message, cleanup_error)

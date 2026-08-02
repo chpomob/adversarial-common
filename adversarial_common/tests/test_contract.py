@@ -502,7 +502,7 @@ class _FakeGitAdapter:
     def get_current_branch(self, workdir):
         return "main"
 
-    def stash_dirty(self, workdir, *, on_pushed=None):
+    def stash_dirty(self, workdir, *, on_pushed=None, state=None):
         if on_pushed is not None:
             on_pushed("push-marker")
         return self.resolved_stash

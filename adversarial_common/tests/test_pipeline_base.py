@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from adversarial_common import pipeline_base as pb
+from adversarial_common import gitops, pipeline_base as pb
 
 
 class FakeLedger:
@@ -48,7 +48,7 @@ class FakeGit:
         self.repo = True
         self.branch = "main"
 
-    def stash_dirty(self, workdir, *, on_pushed=None):
+    def stash_dirty(self, workdir, *, on_pushed=None, state=None):
         self._call("stash", workdir)
         if self.stash and on_pushed is not None:
             on_pushed("stash@{0}")
@@ -349,6 +349,15 @@ def test_setup_git_existing_repo_updates_recovery_state():
     assert state == {
         "stash_id": "stash-sha", "parent_branch": "main",
         "branch": "spec/feature/1", "branch_point": "abc123",
+        "transactions": [
+            {"step": "_create_branch", "status": "success", "detail": ""},
+            {"step": "_checkout_branch", "status": "success", "detail": ""},
+            {"step": "_record_branch_point", "status": "success", "detail": ""},
+            {"step": "_apply_gitignore", "status": "success", "detail": ""},
+        ],
+        "last_transaction": {
+            "outcome": "success", "label": "git_setup_branch", "workdir": "/safe",
+        },
     }
     assert ("identity", "/safe") in fake.calls
     assert ("gitignore", "/safe", ".adversarial-spec/") in fake.calls
@@ -396,6 +405,34 @@ def test_setup_git_callback_error_is_mapped():
         ),
     )
     assert result == {"exit_code": 1, "error": "callback"}
+
+
+def test_setup_git_transaction_logged(tmp_path):
+    """AC1 (P13/R15): stash push and branch creation each run through
+    gitops.run_transaction (the P9 atomic helper), and both transactions'
+    logs surface in run diagnostics (state["transactions"]) instead of being
+    silently dropped, using the real gitops adapter end-to-end.
+    """
+    gitops.auto_init(tmp_path)
+    (tmp_path / "f.txt").write_text("v1")
+    gitops.commit_all(tmp_path, "base")
+    (tmp_path / "f.txt").write_text("v2")
+
+    state = {}
+    result = pb.setup_git(tmp_path, "feature", state)
+
+    assert result["exit_code"] == 0
+    steps = [entry["step"] for entry in state["transactions"]]
+    assert "_push" in steps, steps  # gitops.stash_dirty's own step (stash push)
+    assert "_create_branch" in steps, steps  # this function's step (branch creation)
+    assert all(
+        entry["status"] == "success" for entry in state["transactions"]
+    ), state["transactions"]
+    assert state["last_transaction"] == {
+        "outcome": "success", "label": "git_setup_branch",
+        "workdir": str(tmp_path),
+    }
+    assert (tmp_path / "f.txt").read_text() == "v1"
 
 
 def test_restore_git_checks_out_then_unstashes_and_atomically_persists(tmp_path):
