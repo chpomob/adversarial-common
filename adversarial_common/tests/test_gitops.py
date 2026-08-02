@@ -473,3 +473,169 @@ class TestGitOps:
         with open(os.path.join(self.tmpdir, ".gitignore")) as fh:
             content = fh.read()
         assert content.count("*.log") == 1
+
+
+class TestRunTransaction:
+    """run_transaction: atomic step execution with rollback + transaction log."""
+
+    def test_transaction_runs_all_steps_and_logs(self):
+        # AC1: step1 succeeds, step2 fails, rollback runs, log records all.
+        calls = []
+
+        def step_one():
+            calls.append("step_one")
+
+        def step_two():
+            calls.append("step_two")
+            raise RuntimeError("boom")
+
+        rollback_calls = []
+
+        def rollback():
+            rollback_calls.append("rollback")
+
+        log, outcome = gitops.run_transaction(
+            [step_one, step_two], rollback, label="build",
+        )
+
+        # Steps ran in order until the failure; rollback ran after it.
+        assert calls == ["step_one", "step_two"]
+        assert rollback_calls == ["rollback"]
+
+        assert [entry["step"] for entry in log] == [
+            "step_one", "step_two", "rollback",
+        ]
+        assert log[0] == {
+            "step": "step_one", "status": "success", "detail": "",
+        }
+        assert log[1]["step"] == "step_two"
+        assert log[1]["status"] == "failed"
+        assert "RuntimeError: boom" in log[1]["detail"]
+        assert log[2] == {
+            "step": "rollback", "status": "executed", "detail": "",
+        }
+
+        assert outcome["outcome"] == "failed"
+        assert outcome["label"] == "build"
+        assert outcome["failed_step"] == "step_two"
+        assert outcome["rollback"] == "executed"
+
+    def test_transaction_no_rollback_on_all_success(self):
+        # AC2: all steps pass, rollback never called, log shows all succeeded.
+        rollback_calls = []
+
+        def rollback():
+            rollback_calls.append("rollback")
+
+        def step_one():
+            pass
+
+        def step_two():
+            pass
+
+        log, outcome = gitops.run_transaction(
+            [step_one, step_two], rollback, label="ok",
+        )
+
+        assert rollback_calls == []
+        assert [entry["step"] for entry in log] == ["step_one", "step_two"]
+        assert all(entry["status"] == "success" for entry in log)
+        assert outcome["outcome"] == "success"
+        assert outcome["label"] == "ok"
+        assert "failed_step" not in outcome
+        assert "rollback" not in outcome
+
+    def test_transaction_appends_log_to_state(self):
+        # R2: the transaction log is appended to run diagnostics (state).
+        state = {}
+
+        def boom():
+            raise ValueError("nope")
+
+        log, outcome = gitops.run_transaction(
+            [boom], lambda: None, label="t", state=state,
+        )
+
+        assert state["transactions"] == log
+        assert state["last_transaction"] == outcome
+
+    def test_transaction_records_workdir_from_scope(self):
+        # R1: the helper is contextual — the bound workdir is recorded.
+        with gitops.transaction_scope("/repo/path"):
+            _log, outcome = gitops.run_transaction(
+                [lambda: None], None, label="scoped",
+            )
+        assert outcome["workdir"] == "/repo/path"
+
+    def test_transaction_non_reentrant(self):
+        # R1: calling run_transaction while one is in flight raises GitError.
+        gitops._transaction_ctx.active = True
+        gitops._transaction_ctx.label = "outer"
+        try:
+            with pytest.raises(gitops.GitError, match="non-reentrant"):
+                gitops.run_transaction([lambda: None], None, label="inner")
+        finally:
+            gitops._transaction_ctx.active = False
+            gitops._transaction_ctx.label = None
+
+    def test_transaction_rollback_error_does_not_mask_step_failure(self):
+        # A failing rollback is recorded, not raised over the original failure.
+        def step():
+            raise RuntimeError("step blew up")
+
+        def rollback():
+            raise OSError("rollback also blew up")
+
+        log, outcome = gitops.run_transaction([step], rollback, label="messy")
+
+        assert log[0]["status"] == "failed"
+        assert log[1]["step"] == "rollback"
+        assert log[1]["status"] == "error"
+        assert "OSError" in log[1]["detail"]
+        assert outcome["outcome"] == "failed"
+        assert outcome["rollback"] == "error"
+
+    def test_transaction_keyboardinterrupt_rolls_back_records_and_reraises(self):
+        # A1: an interruption must still run rollback, leave diagnostics in
+        # state, and then propagate so the run is not left half-applied.
+        import json
+        from pathlib import Path
+
+        rollback_calls = []
+
+        def step():
+            raise KeyboardInterrupt("ctrl-c")
+
+        def rollback():
+            rollback_calls.append(True)
+
+        state = {}
+        with pytest.raises(KeyboardInterrupt):
+            gitops.run_transaction(
+                [step], rollback, label="kbi", state=state,
+            )
+
+        assert rollback_calls == [True]
+        assert state["last_transaction"]["outcome"] == "failed"
+        assert state["last_transaction"]["failed_step"] == "step"
+        assert state["last_transaction"]["rollback"] == "executed"
+        # outcome is JSON-serializable (also covers A2 for the failure path).
+        json.dumps(state["last_transaction"])
+
+    def test_transaction_path_workdir_is_json_serializable(self):
+        # A2: a pathlib.Path bound via transaction_scope must not leak a
+        # PosixPath into state, where json.dumps has no custom encoder.
+        import json
+        from pathlib import Path
+
+        state = {}
+        with gitops.transaction_scope(Path("/repo/path")):
+            _log, outcome = gitops.run_transaction(
+                [lambda: None], None, label="scoped", state=state,
+            )
+
+        assert outcome["workdir"] == "/repo/path"
+        assert isinstance(outcome["workdir"], str)
+        # state["last_transaction"] survives the project's plain json.dumps.
+        json.dumps(state["last_transaction"])
+

@@ -9,7 +9,9 @@ mutation lands in.
 import os
 import re
 import subprocess
+import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -533,3 +535,144 @@ def cherry_pick(workdir, commit_ref):
         # Clean up: abort the cherry-pick so the index is not mid-merge.
         _run(workdir, ["cherry-pick", "--abort"])
         raise GitError(f"cherry-pick {commit_ref} failed: {detail}")
+
+
+# --- atomic transactions ----------------------------------------------------
+
+# Thread-local transaction context: the workdir bound by
+# :func:`transaction_scope` (so a transaction's record is attributable to the
+# right checkout), plus the non-reentrancy guard and the in-flight label.
+_transaction_ctx = threading.local()
+
+
+@contextmanager
+def transaction_scope(workdir):
+    """Bind *workdir* as the current transaction context.
+
+    A transaction run inside this block records *workdir* in its outcome so a
+    mid-transaction failure is attributable to the right checkout in the run
+    diagnostics. Optional — :func:`run_transaction` works without it
+    (``workdir`` is recorded as ``None``). Nestable: each scope restores the
+    previous binding on exit.
+    """
+    prev = getattr(_transaction_ctx, "workdir", None)
+    _transaction_ctx.workdir = workdir
+    try:
+        yield
+    finally:
+        _transaction_ctx.workdir = prev
+
+
+def _step_name(step, index, label):
+    """Best-effort human name for *step* (its ``__name__`` or positional fallback)."""
+    name = getattr(step, "__name__", None)
+    if name and name != "<lambda>":
+        return name
+    return f"{label}_step_{index}"
+
+
+def _run_rollback(rollback):
+    """Invoke *rollback* best-effort. Returns ``(status, detail)``.
+
+    A rollback is expected to be idempotent; it is invoked at most once per
+    transaction. A rollback error is never raised over the original step
+    failure — it is captured in *detail* so the cleanup attempt is still
+    observable in the log.
+    """
+    if rollback is None:
+        return "skipped", ""
+    try:
+        rollback()
+        return "executed", ""
+    except Exception as exc:
+        # ponytail: rollback is best-effort/idempotent; never let a cleanup
+        # error mask the original step failure. Surface it in the log instead.
+        return "error", f"{type(exc).__name__}: {exc}"
+
+
+def run_transaction(steps, rollback, *, label, state=None):
+    """Execute *steps* transactionally, rolling back on the first failure.
+
+    Each entry in *steps* is a zero-argument callable run in order. On the
+    first step that raises, *rollback* (a zero-argument, idempotent callable,
+    or ``None``) is invoked once and its result recorded. The transaction then
+    stops — later steps do not run. An interruption (``KeyboardInterrupt`` /
+    ``SystemExit`` / other ``BaseException``) is treated as a failure too:
+    rollback runs and diagnostics land in *state* before the exception is
+    re-raised, so the mid-transaction case stays atomic and observable.
+
+    Returns ``(log, outcome)``:
+
+    - ``log``: list of ``{"step", "status", "detail"}`` entries, one per
+      executed step plus a final ``rollback`` entry when a failure occurred.
+    - ``outcome``: ``{"outcome": "success"|"failed", "label", "workdir"}``,
+      extended with ``failed_step`` and ``rollback`` on failure.
+
+    The helper is **non-reentrant**: calling it again while a transaction is
+    already running (e.g. from within a step) raises :class:`GitError`. It is
+    **contextual**: bind the workdir with :func:`transaction_scope` so the
+    record is attributable to the right checkout.
+
+    When *state* (a mutable mapping) is supplied, the log is appended to
+    ``state["transactions"]`` and the outcome stored as
+    ``state["last_transaction"]`` — so a mid-transaction failure is observable
+    in the run diagnostics (state / final.json) rather than silently swallowed.
+    """
+    if getattr(_transaction_ctx, "active", False):
+        raise GitError(
+            f"run_transaction({label!r}) is non-reentrant: transaction "
+            f"{_transaction_ctx.label!r} is already running"
+        )
+    # A2: normalize so a pathlib.Path bound via transaction_scope stays
+    # JSON-serializable in state["last_transaction"] (the project's JSON
+    # writers use json.dumps without a custom encoder).
+    workdir = getattr(_transaction_ctx, "workdir", None)
+    workdir = os.fspath(workdir) if workdir is not None else None
+    _transaction_ctx.active = True
+    _transaction_ctx.label = label
+    log = []
+    failed_step = None
+    rollback_status = None
+    interrupt_exc = None
+    try:
+        for index, step in enumerate(steps):
+            name = _step_name(step, index, label)
+            try:
+                step()
+            except BaseException as exc:
+                failed_step = name
+                log.append({
+                    "step": name, "status": "failed",
+                    "detail": f"{type(exc).__name__}: {exc}",
+                })
+                rollback_status, rollback_detail = _run_rollback(rollback)
+                log.append({
+                    "step": "rollback", "status": rollback_status,
+                    "detail": rollback_detail,
+                })
+                if not isinstance(exc, Exception):
+                    # A1: interruptions (KeyboardInterrupt/SystemExit) must
+                    # still roll back and leave diagnostics, then propagate.
+                    interrupt_exc = exc
+                break
+            log.append({"step": name, "status": "success", "detail": ""})
+    finally:
+        _transaction_ctx.active = False
+        _transaction_ctx.label = None
+
+    outcome = {
+        "outcome": "failed" if failed_step is not None else "success",
+        "label": label,
+        "workdir": workdir,
+    }
+    if failed_step is not None:
+        outcome["failed_step"] = failed_step
+    if rollback_status is not None:
+        outcome["rollback"] = rollback_status
+
+    if state is not None:
+        state.setdefault("transactions", []).extend(log)
+        state["last_transaction"] = outcome
+    if interrupt_exc is not None:
+        raise interrupt_exc
+    return log, outcome
