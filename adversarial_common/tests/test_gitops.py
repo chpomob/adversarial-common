@@ -318,6 +318,95 @@ class TestGitOps:
         remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
         assert remaining.splitlines() == [second_sha]
 
+    # --- P10: stash transaction atomicity -----------------------------------
+
+    def test_stash_identity_is_sha_atomic(self):
+        # AC1: push a stash, let a concurrent/unrelated stash land on top of
+        # it, then unstash by the recorded SHA — the SHA is bound to this
+        # stash's content, not to a stack position, so the right content
+        # comes back even though it is no longer stash@{0}.
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+
+        _write(self.tmpdir, "f.txt", "v2-mine")
+        my_sha = gitops.stash_dirty(self.tmpdir)
+        assert not gitops.is_dirty(self.tmpdir)
+
+        # A concurrent stash push (e.g. another process/run) lands on top,
+        # shifting stash@{0} to point at it instead of my_sha.
+        _write(self.tmpdir, "other.txt", "concurrent")
+        concurrent_sha = gitops.stash_dirty(self.tmpdir)
+        stash_shas, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert stash_shas.splitlines() == [concurrent_sha, my_sha]
+
+        gitops.unstash(self.tmpdir, my_sha)
+
+        assert _read(self.tmpdir, "f.txt") == "v2-mine"
+        assert not os.path.exists(os.path.join(self.tmpdir, "other.txt"))
+        remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert remaining.splitlines() == [concurrent_sha]
+
+    def test_stash_interrupted_resolution_recoverable(self):
+        # AC2: an interruption mid-resolution (after push, before the SHA
+        # lookup completes) must still leave the stash recoverable by
+        # content via the id handed to on_pushed — run_transaction's
+        # rollback never drops the just-pushed stash, since doing so would
+        # destroy the user's work instead of merely failing to name it.
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        _write(self.tmpdir, "f.txt", "v2")
+
+        recorded = {}
+
+        def recorder(stash_id):
+            recorded["stash_id"] = stash_id
+
+        orig_git = gitops._git
+
+        def interrupting_git(workdir, args):
+            if args[:3] == ["rev-parse", "--verify", "stash@{0}"]:
+                raise KeyboardInterrupt("simulated Ctrl-C during resolution")
+            return orig_git(workdir, args)
+
+        gitops._git = interrupting_git
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                gitops.stash_dirty(self.tmpdir, on_pushed=recorder)
+        finally:
+            gitops._git = orig_git
+
+        # The push step already succeeded and recorded a content-addressed
+        # id before the interruption hit the resolve step.
+        assert recorded["stash_id"].startswith(gitops._STASH_MARKER_PREFIX)
+        stash_list, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert stash_list.strip() != ""
+
+        gitops.unstash(self.tmpdir, recorded["stash_id"])
+
+        assert _read(self.tmpdir, "f.txt") == "v2"
+        remaining, _, _ = _git(self.tmpdir, "stash", "list", "--format=%H")
+        assert remaining.strip() == ""
+
+    def test_unstash_verifies_sha_exists(self):
+        # AC3: a SHA that resolves to a real git object but is not (or is no
+        # longer) in the stash list must fail gracefully with a GitError,
+        # not an unhandled exception or a silent no-op.
+        gitops.auto_init(self.tmpdir)
+        _write(self.tmpdir, "f.txt", "v1")
+        gitops.commit_all(self.tmpdir, "base")
+        missing_sha = gitops.head_sha(self.tmpdir)
+
+        with pytest.raises(gitops.GitError, match="no longer in the stash list"):
+            gitops.unstash(self.tmpdir, missing_sha)
+
+        # An opaque id that resolves to nothing at all (not a real object,
+        # not a marker in the stash reflog) is equally graceful.
+        bogus_marker = gitops._STASH_MARKER_PREFIX + "0" * 32
+        with pytest.raises(gitops.GitError, match="could not resolve stash identity"):
+            gitops.unstash(self.tmpdir, bogus_marker)
+
     # --- branch management --------------------------------------------------
 
     def test_create_loop_branch(self):

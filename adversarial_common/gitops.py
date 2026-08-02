@@ -195,21 +195,25 @@ def _resolve_stash_identity(workdir, stash_ref):
     raise GitError(f"could not resolve stash identity {stash_ref!r}")
 
 
-def stash_dirty(workdir, *, on_pushed=None):
+def stash_dirty(workdir, *, on_pushed=None, state=None):
     """Stash any dirty changes (including untracked).
 
     Returns the stash commit SHA or ``""`` when nothing was stashed. The SHA
     remains bound to this stash even if later stash operations change the
     position of ``stash@{0}``.
 
-    The stash is pushed with a unique marker message so it can be found by
-    content rather than by position. After a successful ``git stash push -u``
-    the SHA is resolved via ``stash@{0}`` (deterministic — nothing between
-    the push and this attempt creates another stash); on failure it is
-    recovered by searching the stash list for the marker via
-    :func:`_resolve_stash_identity`, which remains correct even if another
-    stash lands on top before recovery runs. If every post-push resolution
-    command fails or is interrupted, the marker itself is returned (which
+    Push and resolve run as a single atomic unit via :func:`run_transaction`
+    (see the module's "atomic transactions" section): the stash is pushed
+    with a unique marker message so it can be found by content rather than
+    by position, and the resolve step always records a content-addressed
+    identity — a real SHA when available, the marker otherwise — never a
+    positional ref like ``stash@{0}`` itself. After a successful
+    ``git stash push -u`` the SHA is resolved via ``stash@{0}``
+    (deterministic — nothing between the push and this attempt creates
+    another stash); on failure it is recovered by searching the stash list
+    for the marker via :func:`_resolve_stash_identity`, which remains correct
+    even if another stash lands on top before recovery runs. If every
+    post-push resolution command fails, the marker itself is returned (which
     :func:`unstash` re-resolves the same way at restore time). A caller that
     records the id only from this return value therefore never orphans a
     stash it cannot later pop, even when capture is interrupted
@@ -219,71 +223,116 @@ def stash_dirty(workdir, *, on_pushed=None):
     ``git stash push -u`` succeeds and BEFORE any resolution attempt — this
     costs no git call and cannot fail. A caller that records this into its
     run state is protected against an interruption (e.g. ``KeyboardInterrupt``
-    — a ``BaseException`` that the resolution guards below do not catch)
-    during the subsequent SHA lookup: even if ``stash_dirty`` itself raises
-    before returning, the state already holds a recoverable, position-
+    — a ``BaseException`` the resolve step's guards don't catch) during the
+    subsequent SHA lookup: even if ``stash_dirty`` itself raises before
+    returning (``run_transaction`` re-raises interruptions after rolling
+    back and logging), the state already holds a recoverable, position-
     independent id that :func:`unstash` re-resolves at restore time, so the
     user's stashed work is never orphaned — even if another stash is pushed
     on top of it before that restore happens.
+
+    *state*, if given, receives the transaction log/outcome the same way
+    :func:`run_transaction` always records them (``state["transactions"]`` /
+    ``state["last_transaction"]``).
     """
     if not is_dirty(workdir):
         return ""
     marker = _new_stash_marker()
-    _git(workdir, ["stash", "push", "-u", "-m", marker])
-    if on_pushed is not None:
-        # Record the marker BEFORE resolution, so an interruption
-        # (KeyboardInterrupt / any BaseException the guards below don't catch)
-        # during the SHA lookup still leaves the caller's state holding a
-        # recoverable, position-independent stash identity instead of an
-        # empty id.
-        on_pushed(marker)
-    try:
-        sha = _git(workdir, ["rev-parse", "--verify", "stash@{0}"]).strip()
-        if sha:
-            return sha
-    except (GitError, subprocess.TimeoutExpired):
-        pass
-    try:
-        # ponytail: rev-parse failed after the push succeeded; recover the
-        # SHA by marker instead of orphaning the stash.
-        resolved = _resolve_stash_identity(workdir, marker)
-        if resolved:
-            return resolved
-    except (GitError, subprocess.TimeoutExpired):
-        pass
-    # ponytail: every post-push resolution failed. Return the marker so
-    # unstash re-resolves it (by content, not position) at restore time
-    # instead of raising with an empty id and orphaning the user's work. Worst
-    # case restore_git reports this id to the user for manual recovery.
-    return marker
+    result = {}
+    push_exc = {}
+
+    def _push():
+        try:
+            _git(workdir, ["stash", "push", "-u", "-m", marker])
+        except BaseException as exc:
+            # ponytail: capture the original exception so it can be
+            # re-raised verbatim below — run_transaction only re-raises
+            # BaseException-not-Exception failures itself (interruptions);
+            # a plain push failure (nothing stashed, nothing to recover)
+            # must still propagate to the caller as before.
+            push_exc["exc"] = exc
+            raise
+        if on_pushed is not None:
+            # Record the marker BEFORE resolution, so an interruption
+            # during the SHA lookup still leaves the caller's state holding
+            # a recoverable, position-independent stash identity.
+            on_pushed(marker)
+
+    def _resolve():
+        try:
+            sha = _git(workdir, ["rev-parse", "--verify", "stash@{0}"]).strip()
+            if sha:
+                result["sha"] = sha
+                return
+        except (GitError, subprocess.TimeoutExpired):
+            pass
+        try:
+            # ponytail: rev-parse failed after the push succeeded; recover
+            # the SHA by marker instead of orphaning the stash.
+            resolved = _resolve_stash_identity(workdir, marker)
+            if resolved:
+                result["sha"] = resolved
+                return
+        except (GitError, subprocess.TimeoutExpired):
+            pass
+        # ponytail: every post-push resolution failed. Fall back to the
+        # marker so unstash re-resolves it (by content, not position) at
+        # restore time instead of leaving an empty id and orphaning the
+        # user's work.
+        result["sha"] = marker
+
+    with transaction_scope(workdir):
+        run_transaction([_push, _resolve], None, label="stash_dirty", state=state)
+
+    if "exc" in push_exc:
+        raise push_exc["exc"]
+    return result.get("sha", marker)
 
 
 def unstash(workdir, stash_ref):
-    """Pop *stash_ref* by identity, even if its stash position has changed.
+    """Restore *stash_ref* by identity (apply + drop), even if its stash
+    position has changed.
 
     *stash_ref* is either a stash commit SHA (the common case) or, for the
     rare ``stash_dirty`` interruption/failure fallback, an opaque push
     marker — see :func:`_resolve_stash_identity`. Either form is re-resolved
-    to a SHA and verified against the current stash list immediately before
-    the pop, so a stash pushed later cannot redirect this operation to the
-    wrong entry.
+    to a SHA and its presence in the current stash list is verified before
+    anything is attempted, so a missing/already-restored stash fails
+    gracefully instead of touching the wrong entry.
+
+    Restoring is split into two steps rather than a single positional
+    ``git stash pop``: ``git stash apply <sha>`` addresses the stash by its
+    content-addressed SHA directly (git accepts a raw stash commit here), so
+    the risky content-restoring step is immune to a concurrent stash push
+    shifting positions. Only the trailing ``git stash drop`` needs a
+    positional ``stash@{N}`` ref (git has no SHA-addressed drop); its
+    position is re-resolved from a fresh listing taken immediately
+    beforehand, keeping the race window to the smallest possible gap and
+    always dropping *this* SHA's current slot rather than a stale one.
     """
     stash_sha = _resolve_stash_identity(workdir, stash_ref)
     stash_entries = _git(workdir, ["stash", "list", "--format=%H"]).splitlines()
-    try:
-        stash_index = stash_entries.index(stash_sha)
-    except ValueError as exc:
+    if stash_sha not in stash_entries:
         raise GitError(
             f"stash {stash_ref} ({stash_sha}) is no longer in the stash list"
-        ) from exc
+        )
 
-    pop_ref = f"stash@{{{stash_index}}}"
-    out, err, rc = _run(workdir, ["stash", "pop", pop_ref])
+    out, err, rc = _run(workdir, ["stash", "apply", stash_sha])
     if rc != 0:
         raise GitError(
-            f"git stash pop {stash_ref} failed (possible conflict): "
+            f"git stash apply {stash_ref} failed (possible conflict): "
             f"{(err or out).strip()}"
         )
+
+    entries_after_apply = _git(workdir, ["stash", "list", "--format=%H"]).splitlines()
+    try:
+        stash_index = entries_after_apply.index(stash_sha)
+    except ValueError as exc:
+        raise GitError(
+            f"stash {stash_ref} ({stash_sha}) vanished from the stash list "
+            "after apply"
+        ) from exc
+    _git(workdir, ["stash", "drop", f"stash@{{{stash_index}}}"])
 
 
 # --- branch management ------------------------------------------------------
