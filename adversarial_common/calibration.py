@@ -132,8 +132,13 @@ def _load_corpus(corpus_dir: Path) -> list[dict[str, Any]]:
             continue
         diff_path = child / "diff.txt"
         gold_path = child / "gold.json"
-        if not (diff_path.is_file() and gold_path.is_file()):
+        has_diff = diff_path.is_file()
+        has_gold = gold_path.is_file()
+        if not has_diff and not has_gold:
             continue
+        if not (has_diff and has_gold):
+            missing = "diff.txt" if not has_diff else "gold.json"
+            raise ValueError(f"{child.name}: fixture is missing {missing}")
         gold = json.loads(gold_path.read_text())
         if not isinstance(gold, Mapping):
             raise ValueError(f"{child.name}: gold.json must be a JSON object")
@@ -142,6 +147,8 @@ def _load_corpus(corpus_dir: Path) -> list[dict[str, Any]]:
             "diff": diff_path.read_text(),
             "gold": gold,
         })
+    if not fixtures:
+        raise ValueError(f"{corpus_dir}: corpus directory contains no valid fixtures")
     return fixtures
 
 
