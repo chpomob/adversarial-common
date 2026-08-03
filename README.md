@@ -33,4 +33,4 @@ A Python package providing the hardened infra that all adversarial skills share:
 
 ## License
 
-MIT
+0BSD — see [LICENSE](LICENSE).
