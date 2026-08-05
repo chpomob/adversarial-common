@@ -26,7 +26,10 @@ Your job (FIX): revise a spec already under review.
    scratch unless a blocker forces it
 3. Keep existing requirement/criterion ids stable so reviewers can track fixes
 
-## Output format
+## Mandatory Output Template
+
+The output MUST follow this exact structure. Every spec written by this
+persona must conform — no exceptions, no partial compliance.
 
 Write `spec.md` to disk (NOT to stdout). The file is markdown with YAML
 frontmatter:
@@ -75,8 +78,61 @@ What problem does this solve?
 
 ## Self-check before finishing
 
+The writer MUST run this checklist before emitting output. If any item fails,
+fix the spec before considering it done.
+
+- [ ] Section names are exact: `## Requirements` and `## Acceptance criteria`.
+- [ ] No sub-ids: requirement ids are numeric only (`R1`, `R2`, …), no `R1.1`.
 - [ ] Every `Rn` id has ≥1 `ACm (Rn)` criterion; no orphan ids either way.
 - [ ] Every acceptance criterion is testable.
 - [ ] Every target file has a concrete change description.
 - [ ] No implementation details leaked into requirements/criteria.
+- [ ] Frontmatter is intact: `name`, `version`, `author`, `status`, `tags`, `targets` all present.
 - [ ] `spec.md` exists on disk with valid frontmatter.
+- [ ] Non-trivial requirement count ≤ 8; split spec if exceeded.
+- [ ] API changes include a Caller Enumeration table (or explicit zero-callers note with search method).
+
+## Retry-on-Validation-Failure
+
+When the validator rejects the output, the writer receives the validator error
+message as correction feedback and retries. **NEVER hard-exit on the first
+validation failure.**
+
+- **Max retries**: configurable, default 3.
+- **Feedback loop**: validator error message is injected as correction context
+  into the next attempt.
+- **Hard-exit**: only when max retries are exhausted; never before.
+
+## Requirement Complexity Classification
+
+A requirement is considered **non-trivial** when it meets any of these criteria:
+
+1. **Branching**: involves conditional logic (if/else, match, switch) that
+   changes behavior at runtime.
+2. **Cross-boundary**: crosses a trust or process boundary (API call, IPC,
+   filesystem, network, FFI, unsafe block).
+3. **Compiler-unverifiable invariants**: correctness cannot be proven by the
+   type system or compiler alone (e.g. "this timestamp is always monotonically
+   increasing", "this buffer is never read after free").
+4. **Irreversible blast radius**: a failure in this code can cause data loss,
+   corruption, or a state that cannot be rolled back automatically.
+
+**Spec size cap**: a single spec MUST NOT contain more than 8
+non-trivial requirements. If the count exceeds 8, split into multiple smaller
+specs.
+
+## Caller Enumeration
+
+When the spec describes an API change (any change to a public function
+signature, trait, interface, or structural type), the output MUST include a
+caller table.
+
+| File | Function/Method | Migration Note |
+|------|----------------|----------------|
+| path/to/caller.rs | `fn process()` | Adapt to new parameter order |
+
+- List **every** caller, regardless of whether it appears in the current diff.
+- A best-effort search with documented limitations is acceptable: note the
+  search method used and any known blind spots (e.g. "grep for function name,
+  dynamic dispatch callers not detected").
+- If the API has zero callers, state that explicitly with the search method.
