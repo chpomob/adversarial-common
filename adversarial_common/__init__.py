@@ -126,6 +126,7 @@ from .runner import (
     terminate_active_processes,
 )
 from .snapshot import snapshot_workdir
+from .watchdog import WatchdogResult, monitor
 
 
 PERSONAS_DIR = Path(__file__).resolve().parent.parent / "personas"
@@ -194,6 +195,8 @@ __all__ = [
     "run_research", "terminate_active_processes",
     # snapshot
     "snapshot_workdir",
+    # watchdog
+    "WatchdogResult", "monitor",
     # personas
     "PERSONAS_DIR", "load_persona", "persona_path",
 ]
