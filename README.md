@@ -1,5 +1,7 @@
 # adversarial-common
 
+Adversarial Common is a shared foundation for adversarial pipelines — gate enforcement, watchdog monitoring, quota tracking, and consensus evaluation across independent AI models.
+
 Shared engine for multi-persona adversarial pipelines on Hermes Agent / Claude Code / Codex / any LLM CLI.
 
 Powers `adversarial-spec`, `adversarial-plan`, `adversarial-code-loop`, and `adversarial-code-review`.
