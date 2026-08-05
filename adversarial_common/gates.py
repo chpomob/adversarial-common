@@ -9,7 +9,7 @@ import shlex
 import shutil
 import signal
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Final
 
@@ -247,6 +247,136 @@ def _run_verification_gate(
         "truncated": truncated,
     })
     return result
+
+
+_ALLOWLIST_PATH: Final = ".adversarial-gate/skip-allowlist.txt"
+
+_PYTEST_TEST_LINE_RE: Final = re.compile(
+    r"^(\S+)\s+(PASSED|FAILED|SKIPPED|ERROR)", re.MULTILINE
+)
+
+
+def _parse_pytest_output(log: str) -> dict[str, list[str]]:
+    """Parse pytest-style verbose output into passed/failed/skipped test names.
+
+    Returns ``{"passed": [...], "failed": [...], "skipped": [...]}``.
+    """
+    result: dict[str, list[str]] = {"passed": [], "failed": [], "skipped": []}
+    for match in _PYTEST_TEST_LINE_RE.finditer(log):
+        status = match.group(2).lower()
+        key = "failed" if status in ("failed", "error") else status
+        result[key].append(match.group(1))
+    return result
+
+
+def _load_allowlist(repo_root: Path) -> list[str] | None:
+    """Load skip allow-list entries from *repo_root*.
+
+    Returns a list of non-empty, non-comment substrings, or ``None`` when the
+    file is missing (R3).
+    """
+    path = repo_root / _ALLOWLIST_PATH
+    if not path.is_file():
+        return None
+    entries: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        entries.append(stripped)
+    return entries
+
+
+def _entry_matches(entry: str, name: str) -> bool:
+    """Return True when *entry* matches *name* with bounded prefix semantics (A2).
+
+    Entries ending with ``_`` or ``-`` are deliberate prefix markers and
+    match any continuation.  Otherwise the character immediately after the
+    matched substring must be a separator (``_``, ``.``, ``:``, ``/``,
+    ``-``) or the end of *name*, preventing short entries like ``test_a``
+    from silently widening to ``test_abc``.
+    """
+    idx = name.find(entry)
+    if idx == -1:
+        return False
+    # Deliberate prefix marker — any continuation is fine.
+    if entry and entry[-1] in ("_", "-"):
+        return True
+    after = idx + len(entry)
+    # Require a separator or end-of-string after the match.
+    if after >= len(name) or name[after] in ("_", ".", ":", "/", "-"):
+        return True
+    return False
+
+
+def _resolve_skips(
+    skipped_names: list[str], repo_root: Path
+) -> tuple[list[str], list[str]]:
+    """Partition *skipped_names* into (allowed, blocked) via the allow-list."""
+    entries = _load_allowlist(repo_root)
+    if entries is None:
+        return [], list(skipped_names)
+    allowed: list[str] = []
+    blocked: list[str] = []
+    for name in skipped_names:
+        if any(_entry_matches(entry, name) for entry in entries):
+            allowed.append(name)
+        else:
+            blocked.append(name)
+    return allowed, blocked
+
+
+def zero_skip_gate(
+    log: str,
+    repo_root: str | os.PathLike[str] | None = None,
+    parser: Callable[[str], dict[str, list[str]]] | None = None,
+) -> dict[str, Any]:
+    """Parse test-runner output and gate on executed/skipped test states (R1).
+
+    *parser* receives the log and must return ``{"passed": [names],
+    "failed": [names], "skipped": [names]}``.  Defaults to a pytest
+    verbose-output parser.  Pass any callable with the same signature to
+    support other runners (pluggable interface, R1).
+
+    *repo_root* locates ``.adversarial-gate/skip-allowlist.txt`` (R2/R3).
+    """
+    root = Path(repo_root) if repo_root is not None else Path.cwd()
+    parse = parser or _parse_pytest_output
+
+    parsed = parse(log)
+    passed_names = parsed["passed"]
+    failed_names = parsed["failed"]
+    skipped_names = parsed["skipped"]
+
+    executed = len(passed_names) + len(failed_names)
+    allowed, blocked = _resolve_skips(skipped_names, root)
+
+    # R4: executed failures decide immediately; skips resolved via allow-list.
+    # Zero recognized test lines = unparseable or empty log → fail (A1).
+    total_recognized = len(passed_names) + len(failed_names) + len(skipped_names)
+    if total_recognized == 0:
+        return {
+            "executed": 0,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "allowed_skipped": 0,
+            "blocked_skipped": 0,
+            "pass": False,
+            "diagnostic": "no_recognizable_test_lines",
+        }
+
+    pass_gate = len(failed_names) == 0 and len(blocked) == 0
+
+    return {
+        "executed": executed,
+        "passed": len(passed_names),
+        "failed": len(failed_names),
+        "skipped": len(skipped_names),
+        "allowed_skipped": len(allowed),
+        "blocked_skipped": len(blocked),
+        "pass": pass_gate,
+    }
 
 
 def run_contract_gate(
@@ -519,5 +649,5 @@ def _positive_number(name: str, value: Any) -> float:
 __all__ = [
     "TRUNCATION_MARKER", "check_context", "enforce_input_cap",
     "enforce_output_cap", "estimate_complexity", "post_build_gate",
-    "post_fix_gate", "pre_build_gate", "run_contract_gate",
+    "post_fix_gate", "pre_build_gate", "run_contract_gate", "zero_skip_gate",
 ]

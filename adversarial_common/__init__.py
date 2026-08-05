@@ -20,6 +20,7 @@ from .gates import (
     post_fix_gate,
     pre_build_gate,
     run_contract_gate,
+    zero_skip_gate,
 )
 from .jsonio import (
     VALID_BASIS,
@@ -151,6 +152,7 @@ __all__ = [
     "TRUNCATION_MARKER", "check_context", "enforce_input_cap",
     "enforce_output_cap", "estimate_complexity", "post_build_gate",
     "post_fix_gate", "pre_build_gate", "run_contract_gate",
+    "zero_skip_gate",
     # jsonio
     "VALID_BASIS", "VALID_CONFIDENCE", "epistemic_distribution",
     "extract_frontmatter", "normalize_findings", "parse_frontmatter",
