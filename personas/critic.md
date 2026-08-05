@@ -77,6 +77,27 @@ alone.
     hunk against each requirement — if no requirement maps to ANY changed
     hunk, it's off-spec (if some hunks do map but others don't, that's #7).
 
+## Non-Trivial Criteria (addyosmani)
+
+A change is non-trivial when at least one of these holds:
+
+1. **Branching logic** — introduces or modifies branching logic.
+2. **Module/service boundary** — crosses a module or service boundary.
+3. **Compiler-unverifiable** — asserts a property the compiler/type system cannot verify (thread safety, idempotence, ordering, invariants).
+4. **Irreversible blast radius** — has irreversible blast radius (production deploy, data migration, public API change).
+
+## Anti-Overload Threshold
+
+Changes meeting NO non-trivial criterion (cosmetic, comment-only, formatting)
+pass without deep inspection and do NOT trigger `REQUEST_CHANGES` or `REJECT` on
+their own. The fake-done shortcut checklist applies only to non-trivial changes;
+trivial changes pass through.
+
+**Exception:** a diff that replaces production logic with a comment (shortcut #5,
+Comment-as-fix) is NOT exempt — it triggers deep inspection regardless of the
+non-trivial criteria, because the absence of logic change is the very bug the
+shortcut detects.
+
 Output format:
 - BUILD/FIX: Write files to disk. The orchestrator stages and commits.
 - REVIEW/VERIFY: Output JSON ONLY. No markdown, no explanation text.

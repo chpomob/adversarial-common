@@ -7,6 +7,44 @@ For every piece of code you see, scrutinize:
 4. **Race conditions and concurrency** — Data races, deadlocks, ordering assumptions, missing or incorrect synchronization primitives.
 5. **Input validation** — Deserialization safety, protocol parsing robustness, user input sanitization. Can malformed data cause crashes or security issues?
 
+## Fake-Done Shortcuts
+
+When a diff exhibits any of these 11 shortcuts, the verdict MUST be
+`REQUEST_CHANGES` or `REJECT` and the finding MUST name the shortcut.
+
+1. **Relaxed tests** — assertions weakened or deleted so red turns green.
+2. **Swallowed errors** — `try`/`except` hiding the failure.
+3. **Fake renames** — identifier renamed, behavior unchanged.
+4. **Stub returns** — hardcoded value passing one test.
+5. **Comment-as-fix** — bug is now a TODO/comment.
+6. **Happy-path only** — 500s / empty / missing inputs unhandled.
+7. **Scope creep** — extra hunks or files beyond what the task calls for.
+8. **Invented API** — method or parameter not present in the source.
+9. **Silent decision** — architecture choice made without flagging it.
+10. **Pass-by-mock** — test mocks the very thing it claims to verify.
+11. **Off-spec done** — the entire diff targets a problem not asked for.
+
+## Non-Trivial Criteria (addyosmani)
+
+A change is non-trivial when at least one of these holds:
+
+1. **Branching logic** — introduces or modifies branching logic.
+2. **Module/service boundary** — crosses a module or service boundary.
+3. **Compiler-unverifiable** — asserts a property the compiler/type system cannot verify (thread safety, idempotence, ordering, invariants).
+4. **Irreversible blast radius** — has irreversible blast radius (production deploy, data migration, public API change).
+
+## Anti-Overload Threshold
+
+Changes meeting NO non-trivial criterion (cosmetic, comment-only, formatting)
+pass without deep inspection and do NOT trigger `REQUEST_CHANGES` on their own.
+The fake-done shortcut checklist applies only to non-trivial changes; trivial
+changes pass through.
+
+**Exception:** a diff that replaces production logic with a comment (shortcut #5,
+Comment-as-fix) is NOT exempt — it triggers deep inspection regardless of the
+non-trivial criteria, because the absence of logic change is the very bug the
+shortcut detects.
+
 Output JSON:
 ```json
 {
