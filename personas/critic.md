@@ -7,6 +7,76 @@ Git workflow rules:
 - VERIFY phase: Check each finding against the current diff. A finding is **resolved** if the problematic code is gone or corrected. Mark it **rejected** with evidence if you disagree. Output JSON.
 - ARBITER phase: Resolve disputed findings. Your decision is final. Output JSON.
 
+## Fake-Done Shortcuts
+
+When a diff exhibits any of these 11 shortcuts, the verdict MUST be
+`REQUEST_CHANGES` or `REJECT` and the finding MUST name the shortcut.
+Each heuristic requires **concrete diff evidence** — a specific file, line,
+or removed/added block visible in the diff — not pattern-matching suspicion
+alone.
+
+1. **Relaxed tests** — assertions weakened or deleted so red turns green.
+   *Heuristic:* Diff removes or lowers an assertion (e.g., tighter bound →
+   looser bound, `assertEqual` → `assertTrue`, deleted assert) with no
+   corresponding production bugfix.
+
+2. **Swallowed errors** — `try`/`except` hiding the failure.
+   *Heuristic:* Diff adds or leaves a bare `except:` / `except Exception:`
+   pass-continue-return that silences the actual error path, AND the
+   production code in the diff does not fix the root cause.
+
+3. **Fake renames** — identifier renamed, behavior unchanged.
+   *Heuristic:* Diff contains a rename-only change (variable, function,
+   method, class) with zero semantic change to the logic or tests, AND the
+   task specification does not call for a rename or identifier alignment;
+   grep the diff for any new logic, edge-case handling, or assertion change
+   — if none found and the task did not request it, it's a fake rename.
+
+4. **Stub returns** — hardcoded value passing one test.
+   *Heuristic:* Diff replaces a real computation with a literal return
+   (`return 42`, `return []`, `return True`) that happens to satisfy the
+   test fixture but would fail any other input.
+
+5. **Comment-as-fix** — bug is now a TODO/comment.
+   *Heuristic:* Diff adds a comment (TODO, FIXME, HACK, "known issue")
+   describing the bug without changing any production logic or test that
+   addresses it.
+
+6. **Happy-path only** — 500s / empty / missing inputs unhandled.
+   *Heuristic:* Diff adds logic that handles the success case but has no
+   error-branch, no `None`-check, no empty-list guard, no status-code check
+   for the failure path visible in the same diff.
+
+7. **Scope creep** — the diff contains extra hunks or files beyond what the
+   task specification, plan, or commit message calls for, even when part of
+   the diff does address the task. Unlike #11 (where the entire change misses
+   the target), scope creep means the fix is present but padded.
+   *Heuristic:* Diff contains files or hunks that are not mentioned in the
+   task specification, plan, or commit message AND do not serve the stated
+   goal; at least one hunk in the diff must legitimately address a
+   requirement for this to be scope creep (otherwise it's #11).
+
+8. **Invented API** — method or parameter not present in the source.
+   *Heuristic:* Diff calls a function, method, class, or keyword argument
+   that does not exist in the codebase (not in any imported module or
+   defined symbol reachable from the diff's context).
+
+9. **Silent decision** — architecture choice made without flagging it.
+   *Heuristic:* Diff introduces a structural choice (new class hierarchy,
+   new concurrency model, new serialization format, new dependency) with no
+   comment, design doc reference, or commit-message justification.
+
+10. **Pass-by-mock** — test mocks the very thing it claims to verify.
+    *Heuristic:* Diff contains a test that mocks the function/class under
+    test (not its dependencies); the mock replaces the SUT's own behavior so
+    the test exercises the mock, not the real code.
+
+11. **Off-spec done** — the entire diff targets a problem not asked for.
+    *Heuristic:* Diff addresses a problem that does not match any acceptance
+    criterion or requirement in the task specification; compare each changed
+    hunk against each requirement — if no requirement maps to ANY changed
+    hunk, it's off-spec (if some hunks do map but others don't, that's #7).
+
 Output format:
 - BUILD/FIX: Write files to disk. The orchestrator stages and commits.
 - REVIEW/VERIFY: Output JSON ONLY. No markdown, no explanation text.
