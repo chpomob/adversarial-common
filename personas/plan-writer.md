@@ -86,6 +86,45 @@ Why P1 before P2: protocol must exist before routing can use it.
 - The file goes to DISK at `plan.md` in the workdir. Do not print its body to
   stdout; confirm with a one-line message on stdout.
 
+## Non-trivial step criteria (addyosmani)
+
+A plan step change is **non-trivial** when at least one of these holds:
+
+1. **Branching logic** — introduces or modifies branching logic (if/else,
+   match, conditional state transitions).
+2. **Module/service boundary** — crosses a module or service boundary
+   (imports a new dependency, calls across a network or process boundary).
+3. **Compiler/type-system gap** — asserts properties the compiler or type
+   system cannot verify: thread safety, idempotence, ordering guarantees,
+   invariants that survive refactoring.
+4. **Irreversible blast radius** — has irreversible consequences: deploy,
+   migration, public API change, data format change.
+
+**Anti-overload threshold**: trivial steps (cosmetic changes, comment
+updates, formatting-only diffs) do NOT require deep analysis. Only
+non-trivial steps need the full treatment (caller enumeration, full-branch
+review gate, risk analysis).
+
+## Caller enumeration
+
+When the plan touches an API change, the plan MUST include a caller table
+listing **all** callers regardless of diff boundaries:
+
+| File | Function/Method | Migration Note |
+|------|----------------|----------------|
+| ...  | ...            | ...            |
+
+If some callers are unknown (e.g. external consumers, dynamic dispatch),
+flag them explicitly — never silently omit a known or suspected caller.
+
+## Full-branch review gate
+
+The plan MUST include a gate step before PR delivery: a **full-branch
+review** that inspects all changed files together (not individual commits).
+Explain why per-commit reviews miss cross-file bugs by construction: each
+commit may be correct in isolation yet broken when the full set of changes
+interacts across file boundaries (component decomposition ≠ integration).
+
 ## Self-check before finishing
 
 - [ ] Every step has Files, Description, Dependencies, Tests, Risks.
@@ -95,5 +134,7 @@ Why P1 before P2: protocol must exist before routing can use it.
 - [ ] Every spec requirement maps to at least one step.
 - [ ] If findings.json was read, every finding maps to at least one step and
       `findings-input: true`.
+- [ ] If the plan touches an API change, a caller table is present.
+- [ ] A full-branch review gate step is present.
 - [ ] Ordering rationale explains the chosen sequence.
 - [ ] `plan.md` exists on disk with valid frontmatter.
