@@ -7,6 +7,7 @@ import pytest
 from adversarial_common.readgate import (
     ReadGatePolicy,
     ReadGateResult,
+    is_enforced_role,
     validate_agent_output,
 )
 
@@ -183,3 +184,54 @@ def test_result_accepts_valid_statuses():
     for s in ("pass", "WARNING", "HARD_ERROR"):
         r = ReadGateResult(marker_found=True, status=s)
         assert r.status == s
+
+
+# -- ReadGatePolicy enforce=False ------------------------------------------
+
+def test_policy_enforce_false_returns_pass_no_marker():
+    """enforce=False returns PASS even when output has no marker."""
+    policy = ReadGatePolicy(enforce=False)
+    result = policy.check("no marker at all", "spec.md")
+    assert result.marker_found is True
+    assert result.status == "pass"
+
+
+def test_policy_enforce_false_no_miss_counting():
+    """enforce=False does not count misses — two calls still PASS."""
+    policy = ReadGatePolicy(enforce=False)
+    policy.check("no marker", "spec.md")
+    result = policy.check("still no marker", "spec.md")
+    assert result.marker_found is True
+    assert result.status == "pass"
+
+
+# -- is_enforced_role ------------------------------------------------------
+
+def test_is_enforced_role_build_false():
+    """build role is relaxed."""
+    assert is_enforced_role("build") is False
+
+
+def test_is_enforced_role_fix_false():
+    """fix role is relaxed."""
+    assert is_enforced_role("fix") is False
+
+
+def test_is_enforced_role_review_true():
+    """review role is enforced."""
+    assert is_enforced_role("review") is True
+
+
+def test_is_enforced_role_verify_true():
+    """verify role is enforced."""
+    assert is_enforced_role("verify") is True
+
+
+def test_is_enforced_role_arbiter_true():
+    """arbiter role is enforced."""
+    assert is_enforced_role("arbiter") is True
+
+
+def test_is_enforced_role_challenge_true():
+    """challenge role is enforced."""
+    assert is_enforced_role("challenge") is True

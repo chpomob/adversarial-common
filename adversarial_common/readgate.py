@@ -100,6 +100,20 @@ def _scan_read_files(node: Any, target: str, depth: int) -> bool:
     return False
 
 
+# -- role classification ---------------------------------------------------
+
+_RELAXED_ROLES: frozenset[str] = frozenset({"build", "fix"})
+
+
+def is_enforced_role(role: str) -> bool:
+    """Return ``False`` for relaxed roles (build, fix), ``True`` for all others.
+
+    Relaxed roles still get the READ marker instruction in their prompt for
+    auditability, but the gate itself does not enforce it.
+    """
+    return role not in _RELAXED_ROLES
+
+
 # -- stateful policy --------------------------------------------------------
 
 class ReadGatePolicy:
@@ -111,6 +125,11 @@ class ReadGatePolicy:
 
     Calls for unrelated paths do not affect each other's streaks.
 
+    When *enforce* is ``False``, ``check()`` always returns a PASS result
+    without inspecting the output or counting misses.  This is intended for
+    non-reading-critical roles (BUILD, FIX) where the marker instruction is
+    still emitted for auditability but never hard-fails.
+
     Example::
 
         policy = ReadGatePolicy()
@@ -120,15 +139,20 @@ class ReadGatePolicy:
         # Second consecutive miss → status="HARD_ERROR"
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, enforce: bool = True) -> None:
         self._misses: dict[str, int] = {}
+        self._enforce = enforce
 
     def check(self, output: str, path: str) -> ReadGateResult:
         """Check *output* for a READ marker for *path*, tracking state.
 
         Returns a ``ReadGateResult`` whose ``status`` reflects the
         escalation policy for consecutive misses on the same path.
+
+        When ``enforce=False``, always returns a PASS result.
         """
+        if not self._enforce:
+            return ReadGateResult(marker_found=True, status="pass")
         result = validate_agent_output(output, path)
         if result.marker_found:
             self._misses[path] = 0
