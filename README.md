@@ -6,6 +6,11 @@ Shared engine for multi-persona adversarial pipelines on Hermes Agent / Claude C
 
 Powers `adversarial-spec`, `adversarial-plan`, `adversarial-code-loop`, and `adversarial-code-review`.
 
+> **Philosophy first.** The process is the product, agents are interchangeable
+> workers. Read [PHILOSOPHY.md](PHILOSOPHY.md) before building on this package —
+> it explains why the primitives exist and how to compose them into new
+> adversarial skills.
+
 ## What it is
 
 A Python package providing the hardened infra that all adversarial skills share:
