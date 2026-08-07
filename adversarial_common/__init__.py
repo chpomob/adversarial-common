@@ -125,6 +125,7 @@ from .runner import (
     run_research,
     terminate_active_processes,
 )
+from .readgate import ReadGatePolicy, ReadGateResult, validate_agent_output
 from .snapshot import snapshot_workdir
 from .watchdog import WatchdogResult, monitor
 
@@ -193,6 +194,8 @@ __all__ = [
     "ci_print", "collect_provider_history", "ensure_final_payload", "fail_phase", "parse_fail_on",
     "run_cli", "run_delegated", "run_parallel", "run_phase_cmd",
     "run_research", "terminate_active_processes",
+    # readgate
+    "ReadGatePolicy", "ReadGateResult", "validate_agent_output",
     # snapshot
     "snapshot_workdir",
     # watchdog
